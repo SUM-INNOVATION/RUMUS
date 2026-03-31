@@ -11,6 +11,9 @@
 
 mod cpu;
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 pub use cpu::CpuBackend;
 
 /// Hardware-agnostic compute contract.

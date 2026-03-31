@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "A native-Rust deep learning framework with explicit memory safety and hardware acceleration"
 
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster"]
+
 [dependencies]
 rumus-macros = { path = "../rumus-macros" }
 safetensors = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
+parking_lot = "0.12"
+
+# GPU-only dependencies (activated by `--features gpu`)
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }

@@ -89,7 +89,7 @@ impl Module for Parameter {
             // src and dst are separate Arc<StorageInner> — no deadlock.
             let src_guard = loaded.storage.data();
             let mut dst_guard = self.tensor.storage.data_write();
-            dst_guard.copy_from_slice(&src_guard);
+            dst_guard.copy_from_slice(&*src_guard);
             drop(dst_guard);
             drop(src_guard);
             self.tensor.storage.bump_version();

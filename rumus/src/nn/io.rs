@@ -35,7 +35,7 @@ pub fn save_safetensors(
     for (name, tensor) in dict {
         let guard = tensor.storage.data();
         // Safe f32 → u8 reinterpretation via bytemuck.
-        let bytes: &[u8] = bytemuck::cast_slice(guard.as_slice());
+        let bytes: &[u8] = bytemuck::cast_slice(&*guard);
         data_map.push((
             name.clone(),
             bytes.to_vec(),

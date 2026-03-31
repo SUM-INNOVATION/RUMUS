@@ -19,7 +19,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M1 — Core Memory Model & CPU Compute** | Complete |
 | **M2 — Autograd Engine** | Complete |
 | **M3 — Core API, Optimizers & MVP Macros** | Complete |
-| M4 — WGPU Acceleration & Memory Pools | Planned |
+| **M4 — WGPU Acceleration & Memory Pools** | In Progress |
 | M5A — Ergonomics & Polish | Planned |
 | M5B — Advanced Vision & Checkpointing | Planned |
 
@@ -55,6 +55,18 @@ all named struct fields. Safetensors serialization via `bytemuck::cast_slice`
 test: XOR MLP trains with Adam, converges in <200 epochs, save/load roundtrip
 produces exact output match.
 
+**Milestone 4** (in progress) adds GPU acceleration foundations. `StorageInner`
+refactored from `std::sync::RwLock<Vec<f32>>` to `parking_lot::RwLock<StorageData>`
+where `StorageData` is an enum (`Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`,
+`Both { cpu, gpu, dirty: DirtySide }`, `Transferring`).  `data()` / `data_write()`
+use `parking_lot::RwLockReadGuard::map` / `RwLockWriteGuard::map` to return
+mapped guards projecting into the CPU vec slice. `GpuContext` singleton via
+`OnceLock<Option<...>>` (never panics on missing hardware). `BufferPool` with
+power-of-2 size bucketing for GPU buffer reuse. Lazy `ensure_cpu` / `ensure_gpu`
+transfers with lock-drop-transfer-reacquire pattern (`Transferring` sentinel
+prevents stalling unrelated readers during blocking GPU IO). All WGPU code is
+feature-gated behind `--features gpu`. WGSL compute shaders next.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -72,7 +84,10 @@ produces exact output match.
 
 | Struct | Role |
 |--------|------|
-| `StorageHandle` | `Arc<StorageInner>` wrapping `RwLock<Vec<f32>>` + atomic version counter + fence |
+| `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
+| `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
+| `GpuContext` | `OnceLock<Option<...>>` singleton holding `wgpu::Device` + `Queue` |
+| `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
 | `AutogradState` | `None` (inference) or `Tracked(Arc<TensorMeta>)` |
@@ -111,12 +126,14 @@ RUMUS/
 ```
 
 ```bash
-cargo build          # builds the entire workspace
-cargo test           # runs all tests
+cargo build                   # CPU-only build
+cargo build --features gpu    # with WGPU GPU backend
+cargo test                    # runs all tests (CPU)
 ```
 
 External dependencies: `syn`/`quote`/`proc-macro2` (macro crate),
-`safetensors` + `bytemuck` (core crate, for model persistence).
+`safetensors` + `bytemuck` + `parking_lot` (core crate).
+GPU-only (behind `--features gpu`): `wgpu` + `pollster`.
 
 ## License
 
