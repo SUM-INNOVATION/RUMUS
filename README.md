@@ -17,18 +17,23 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | Milestone | Status |
 |-----------|--------|
 | **M1 — Core Memory Model & CPU Compute** | Complete |
-| M2 — Autograd Engine | Planned |
+| **M2 — Autograd Engine** | In Progress |
 | M3 — Core API, Optimizers & MVP Macros | Planned |
 | M4 — WGPU Acceleration & Memory Pools | Planned |
 | M5A — Ergonomics & Polish | Planned |
 | M5B — Advanced Vision & Checkpointing | Planned |
 
-Milestone 1 delivers the foundational tensor data model (`StorageHandle`, `Layout`,
-`AutogradState`), the `Backend` trait, a pure-Rust CPU backend with naive `ikj`
-matrix multiplication, zero-copy view operations, and strided-to-contiguous
-materialisation.
+**Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
+`Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
+naive `ikj` matrix multiplication, zero-copy view operations, and
+strided-to-contiguous materialisation.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full engineering blueprint.
+**Milestone 2** (in progress) adds the autograd engine infrastructure:
+`GradientStore` (dumb accumulate-only gradient buffer), `Tape` (append-only
+Wengert list), concrete `BackwardOp` enum (no closures — `AddBackward`,
+`MulBackward`, `MatmulBackward`), `VersionSnapshot` with weak-reference
+semantics to avoid keeping intermediate tensor memory alive, and structured
+`AutogradError` types. Kahn's algorithm backward traversal is next.
 
 ## Building
 

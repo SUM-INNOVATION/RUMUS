@@ -10,8 +10,9 @@
 //! duplicating autograd bookkeeping, and that inference mode carries zero extra
 //! allocation overhead.
 
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 // ---------------------------------------------------------------------------
 // Newtypes — zero-cost, strongly-typed identifiers
@@ -142,12 +143,22 @@ pub struct StorageInner {
     fence: AtomicUsize,
 }
 
+impl fmt::Debug for StorageInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StorageInner")
+            .field("len", &self.data.len())
+            .field("version", &self.version.load(Ordering::Relaxed))
+            .field("fence", &self.fence.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// Thread-safe, reference-counted handle to a shared [`StorageInner`].
 ///
 /// Multiple [`Tensor`]s (e.g. a tensor and its view) may hold handles to the
 /// same inner storage.  The `Arc` provides shared ownership; the atomic
 /// `version` inside provides mutation tracking without locking.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StorageHandle {
     inner: Arc<StorageInner>,
 }
@@ -230,6 +241,57 @@ impl StorageHandle {
     /// Returns `None` if the storage is shared.
     pub fn data_mut(&mut self) -> Option<&mut [f32]> {
         Arc::get_mut(&mut self.inner).map(|inner| inner.data.as_mut_slice())
+    }
+
+    /// Create a [`WeakStorageHandle`] that does not keep the storage alive.
+    ///
+    /// Used by [`crate::autograd::VersionSnapshot`] so that version checks
+    /// do not artificially extend the lifetime of intermediate tensors.
+    pub fn downgrade(&self) -> WeakStorageHandle {
+        WeakStorageHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+}
+
+/// Non-owning handle to a [`StorageInner`].
+///
+/// Does **not** prevent the storage from being deallocated.  Used by the
+/// autograd engine's [`crate::autograd::VersionSnapshot`] to check version
+/// counters without keeping intermediate tensor memory alive.
+///
+/// Call [`upgrade`](WeakStorageHandle::upgrade) to temporarily obtain a
+/// strong reference.  If the storage has already been dropped, `upgrade`
+/// returns `None` — which is fine: a dead tensor cannot have been mutated
+/// in-place.
+#[derive(Clone)]
+pub struct WeakStorageHandle {
+    inner: Weak<StorageInner>,
+}
+
+impl fmt::Debug for WeakStorageHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.inner.upgrade() {
+            Some(inner) => f
+                .debug_struct("WeakStorageHandle")
+                .field("alive", &true)
+                .field("version", &inner.version.load(Ordering::Relaxed))
+                .finish(),
+            None => f
+                .debug_struct("WeakStorageHandle")
+                .field("alive", &false)
+                .finish(),
+        }
+    }
+}
+
+impl WeakStorageHandle {
+    /// Attempt to obtain a strong reference to the storage.
+    ///
+    /// Returns `None` if all strong references have been dropped (the
+    /// tensor data has been freed).
+    pub fn upgrade(&self) -> Option<StorageHandle> {
+        self.inner.upgrade().map(|inner| StorageHandle { inner })
     }
 }
 
