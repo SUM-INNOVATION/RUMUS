@@ -7,8 +7,7 @@
 //! - `CpuBackend` is a zero-sized type with no state.
 //! - Future backends (e.g. `WgpuBackend`) will manage their device/queue
 //!   state globally (via `OnceLock` or thread-local), not through an instance
-//!   threaded into every tensor operation.  This keeps the [`crate::tensor::Tensor`]
-//!   struct small and lifetime-free.
+//!   threaded into every tensor operation.
 
 mod cpu;
 
@@ -17,12 +16,7 @@ pub use cpu::CpuBackend;
 /// Hardware-agnostic compute contract.
 ///
 /// Every method receives **contiguous** `&[f32]` inputs and writes into a
-/// caller-allocated `&mut [f32]` output.  This "caller allocates" convention:
-///
-/// - Avoids hidden allocations inside the backend.
-/// - Maps cleanly to GPU workflows where the output buffer may already live
-///   in device memory.
-/// - Lets the tensor layer own all allocation/lifetime decisions.
+/// caller-allocated `&mut [f32]` output.
 pub trait Backend {
     // ----- Memory allocation ------------------------------------------------
 
@@ -33,24 +27,41 @@ pub trait Backend {
     fn full(len: usize, value: f32) -> Vec<f32>;
 
     // ----- Element-wise math ------------------------------------------------
-    // All slice arguments must have equal length.  The backend does NOT check
-    // this — the caller (tensor ops layer) is responsible for validation.
 
-    /// Element-wise addition: `dst[i] = lhs[i] + rhs[i]`.
+    /// `dst[i] = lhs[i] + rhs[i]`
     fn add(lhs: &[f32], rhs: &[f32], dst: &mut [f32]);
 
-    /// Element-wise multiplication: `dst[i] = lhs[i] * rhs[i]`.
+    /// `dst[i] = lhs[i] - rhs[i]`
+    fn sub(lhs: &[f32], rhs: &[f32], dst: &mut [f32]);
+
+    /// `dst[i] = lhs[i] * rhs[i]`
     fn mul(lhs: &[f32], rhs: &[f32], dst: &mut [f32]);
+
+    /// `dst[i] = scalar * src[i]`
+    fn scale(src: &[f32], dst: &mut [f32], scalar: f32);
+
+    /// `dst[i] = max(0, src[i])`
+    fn relu(src: &[f32], dst: &mut [f32]);
+
+    /// `dst[i] = if input[i] > 0 { out_grad[i] } else { 0 }`
+    fn relu_backward(input: &[f32], out_grad: &[f32], dst: &mut [f32]);
 
     // ----- Matrix math ------------------------------------------------------
 
     /// Dense matrix multiplication: `C = A @ B`.
     ///
-    /// - `a` is row-major `(m × k)`.
-    /// - `b` is row-major `(k × n)`.
-    /// - `dst` is row-major `(m × n)` and **must be pre-zeroed** by the caller.
-    ///
-    /// The implementation may assume all three slices are contiguous and
-    /// correctly sized; no bounds checking is performed.
+    /// `a` is `(m x k)`, `b` is `(k x n)`, `dst` is `(m x n)` pre-zeroed.
     fn matmul(a: &[f32], b: &[f32], dst: &mut [f32], m: usize, k: usize, n: usize);
+
+    // ----- Broadcast / reduction --------------------------------------------
+
+    /// Add a 1-D bias to each row of a 2-D matrix.
+    ///
+    /// `matrix` is `(m x n)`, `bias` is `(n,)`, `dst` is `(m x n)`.
+    fn add_bias(matrix: &[f32], bias: &[f32], dst: &mut [f32], m: usize, n: usize);
+
+    /// Sum along rows: `dst[j] = sum_i(src[i*n + j])`.
+    ///
+    /// `src` is `(m x n)`, `dst` is `(n,)` pre-zeroed.
+    fn sum_rows(src: &[f32], dst: &mut [f32], m: usize, n: usize);
 }

@@ -38,14 +38,18 @@ with `AtomicUsize` edge counting for shared metadata across clones, forward-pass
 tape recording integrated into `add`/`mul`/`matmul`, and Kahn's algorithm
 backward traversal with correct dead-branch decrementing.
 
-**Milestone 3** (in progress) adds state management and optimizers:
-`StorageInner::data` migrated to `RwLock<Vec<f32>>` for safe concurrent reads
-and exclusive optimizer writes (zero `unsafe`). `Parameter` with global
+**Milestone 3** (in progress) adds state management, optimizers, layers, and
+macros. `StorageInner::data` migrated to `RwLock<Vec<f32>>` for safe concurrent
+reads and exclusive optimizer writes (zero `unsafe`). `Parameter` with global
 `AtomicUsize` `ParamId` allocator and auto `requires_grad`. `trait Module`
-(`forward`, `parameters`, `train`/`eval`). `trait Optimizer` with drain-on-apply
-`&mut GradientStore` pattern. `SGD` (with momentum) and `Adam` (with
-`ParamId`-keyed moment buffers and bias correction), both using explicit block
-scoping for `RwLock` write guard lifetimes.
+(state-only: `parameters`, `train`/`eval` — `forward` is deliberately not in
+the trait). `trait Optimizer` with drain-on-apply `&mut GradientStore` pattern.
+`SGD` (with momentum) and `Adam` (with `ParamId`-keyed moment buffers and bias
+correction). `Linear` layer with `[in, out]` weight layout (no-transpose forward),
+Kaiming Uniform init via zero-dep LCG, and `add_bias` with `sum_rows` backward.
+`relu` and `mse_loss` as differentiable ops with fused backward. Cargo workspace
+split (`rumus` + `rumus-macros`), `#[derive(Module)]` proc macro generating
+`parameters()`, `train()`, `eval()` by iterating all named struct fields.
 
 ## Architecture
 
@@ -74,13 +78,15 @@ scoping for `RwLock` write guard lifetimes.
 | `Backend` trait | Stateless associated fns (no `&self`) — `CpuBackend` is zero-sized |
 | `Tape` | Append-only Wengert list of `TapeEntry` nodes |
 | `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked |
-| `BackwardOp` | Concrete enum (`Add`, `Mul`, `Matmul`) — no closures, `Send + Sync` |
+| `BackwardOp` | Concrete enum (7 variants: `Add`, `Sub`, `Mul`, `Matmul`, `Relu`, `MseLoss`, `AddBias`) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
-| `Parameter` | `Tensor` + globally unique `ParamId` (auto `requires_grad`) |
-| `Module` trait | `forward(&self)`, `parameters()`, `train`/`eval` |
+| `Parameter` | `Tensor` + globally unique `ParamId` (auto `requires_grad`), implements `Module` |
+| `Module` trait | State-only: `parameters()`, `train`/`eval` — `forward` is an inherent method, not in the trait |
+| `#[derive(Module)]` | Proc macro generating `parameters`/`train`/`eval` by iterating struct fields |
 | `Optimizer` trait | `step(&mut self, &mut GradientStore)` — drain pattern |
 | `SGD` | Vanilla + momentum, `RwLock` write guards with block scoping |
 | `Adam` | `ParamId`-keyed moment buffers, bias correction, block-scoped locks |
+| `Linear` | `[in, out]` weight layout, Kaiming init, `add_bias` for 1D bias broadcasting |
 
 ### Backward Engine
 
@@ -92,12 +98,22 @@ Kahn's algorithm in reverse tape order:
 
 ## Building
 
-```bash
-cargo build
-cargo test
+The project is a Cargo workspace with two crates:
+
+```
+RUMUS/
+├── rumus/          # core framework
+└── rumus-macros/   # #[derive(Module)] proc macro
 ```
 
-No external dependencies are required for the CPU backend.
+```bash
+cargo build          # builds the entire workspace
+cargo test           # runs all tests
+```
+
+The only external dependencies are `syn`, `quote`, and `proc-macro2` in the
+macro crate. The core `rumus` crate has zero external dependencies beyond the
+proc macro.
 
 ## License
 

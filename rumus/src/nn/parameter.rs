@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::nn::Module;
 use crate::tensor::{GradId, ParamId, Tensor};
 
 /// Global monotonically increasing `ParamId` counter.
@@ -55,5 +56,15 @@ impl Parameter {
         self.tensor
             .grad_id()
             .expect("Parameter tensor must have a GradId")
+    }
+}
+
+/// `Module` impl for `Parameter` — enables uniform field iteration in
+/// the `#[derive(Module)]` macro.  Every field in a module struct can
+/// have `.parameters()` called on it regardless of whether it's a
+/// `Parameter`, `Linear`, or a nested user-defined module.
+impl Module for Parameter {
+    fn parameters(&self) -> Vec<Parameter> {
+        vec![self.clone()]
     }
 }

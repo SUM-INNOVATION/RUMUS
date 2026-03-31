@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, BackwardOp, MatmulBackward, MulBackward, TapeEntry, VersionSnapshot,
+    AddBackward, AddBiasBackward, BackwardOp, MatmulBackward, MseLossBackward, MulBackward,
+    ReluBackward, SubBackward, TapeEntry, VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
 use crate::tensor::{AutogradState, Layout, StorageHandle, Tensor, TensorMeta};
@@ -354,6 +355,275 @@ impl Tensor {
                         n,
                     }),
                     inputs: vec![lhs_gid, rhs_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            let out_meta = Arc::new(TensorMeta {
+                requires_grad: true,
+                grad_id: Some(out_grad_id),
+                creator: op_id,
+                is_leaf: false,
+                retains_grad: false,
+                total_grads: AtomicUsize::new(0),
+            });
+
+            Tensor {
+                storage: StorageHandle::new(dst),
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(out_meta),
+            }
+        } else {
+            Tensor::new(dst, result_shape)
+        }
+    }
+
+    /// Element-wise subtraction.  Returns a new contiguous tensor.
+    pub fn sub(&self, rhs: &Tensor) -> Tensor {
+        assert_eq!(
+            self.shape(),
+            rhs.shape(),
+            "sub: shape mismatch {:?} vs {:?}",
+            self.shape(),
+            rhs.shape(),
+        );
+
+        let lhs_c = self.contiguous();
+        let rhs_c = rhs.contiguous();
+
+        let lhs_guard = lhs_c.storage.data();
+        let rhs_guard = rhs_c.storage.data();
+
+        let mut dst = CpuBackend::zeros(lhs_c.numel());
+        CpuBackend::sub(&lhs_guard, &rhs_guard, &mut dst);
+
+        let result_shape = lhs_c.shape().to_vec();
+        drop(rhs_guard);
+        drop(lhs_guard);
+
+        if should_record(self, rhs) {
+            let out_grad_id = context::next_grad_id();
+            let lhs_gid = require_grad_id(self).unwrap_or_else(context::next_grad_id);
+            let rhs_gid = require_grad_id(rhs).unwrap_or_else(context::next_grad_id);
+            let lhs_version = VersionSnapshot::new(lhs_gid, &self.storage);
+            let rhs_version = VersionSnapshot::new(rhs_gid, &rhs.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(meta) = rhs.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Sub(SubBackward { lhs_version, rhs_version }),
+                    inputs: vec![lhs_gid, rhs_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            let out_meta = Arc::new(TensorMeta {
+                requires_grad: true,
+                grad_id: Some(out_grad_id),
+                creator: op_id,
+                is_leaf: false,
+                retains_grad: false,
+                total_grads: AtomicUsize::new(0),
+            });
+
+            Tensor {
+                storage: StorageHandle::new(dst),
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(out_meta),
+            }
+        } else {
+            Tensor::new(dst, result_shape)
+        }
+    }
+
+    /// Element-wise ReLU: `max(0, x)`.  Returns a new contiguous tensor.
+    pub fn relu(&self) -> Tensor {
+        let input_c = self.contiguous();
+        let in_guard = input_c.storage.data();
+
+        let mut dst = CpuBackend::zeros(input_c.numel());
+        CpuBackend::relu(&in_guard, &mut dst);
+
+        let result_shape = input_c.shape().to_vec();
+        drop(in_guard);
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Relu(ReluBackward {
+                        input_storage: self.storage.clone(),
+                        input_layout: self.layout.clone(),
+                        input_version,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            let out_meta = Arc::new(TensorMeta {
+                requires_grad: true,
+                grad_id: Some(out_grad_id),
+                creator: op_id,
+                is_leaf: false,
+                retains_grad: false,
+                total_grads: AtomicUsize::new(0),
+            });
+
+            Tensor {
+                storage: StorageHandle::new(dst),
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(out_meta),
+            }
+        } else {
+            Tensor::new(dst, result_shape)
+        }
+    }
+
+    /// Fused mean squared error loss: `sum((self - target)^2) / N`.
+    ///
+    /// Returns a scalar tensor (shape `[1]`).  Only `self` (the prediction)
+    /// receives a gradient; `target` is treated as a constant.
+    pub fn mse_loss(&self, target: &Tensor) -> Tensor {
+        assert_eq!(
+            self.shape(),
+            target.shape(),
+            "mse_loss: shape mismatch {:?} vs {:?}",
+            self.shape(),
+            target.shape(),
+        );
+
+        let pred_c = self.contiguous();
+        let targ_c = target.contiguous();
+        let pred_guard = pred_c.storage.data();
+        let targ_guard = targ_c.storage.data();
+        let numel = pred_c.numel();
+
+        let mut sum = 0.0f32;
+        for i in 0..numel {
+            let diff = pred_guard[i] - targ_guard[i];
+            sum += diff * diff;
+        }
+        let loss_val = sum / numel as f32;
+
+        drop(targ_guard);
+        drop(pred_guard);
+
+        let dst = vec![loss_val];
+        let result_shape = vec![1];
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let pred_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let pred_version = VersionSnapshot::new(pred_gid, &self.storage);
+            let target_version = VersionSnapshot::new(
+                context::next_grad_id(),
+                &target.storage,
+            );
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::MseLoss(MseLossBackward {
+                        pred_storage: self.storage.clone(),
+                        pred_layout: self.layout.clone(),
+                        pred_version,
+                        target_storage: target.storage.clone(),
+                        target_layout: target.layout.clone(),
+                        target_version,
+                        numel,
+                    }),
+                    inputs: vec![pred_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            let out_meta = Arc::new(TensorMeta {
+                requires_grad: true,
+                grad_id: Some(out_grad_id),
+                creator: op_id,
+                is_leaf: false,
+                retains_grad: false,
+                total_grads: AtomicUsize::new(0),
+            });
+
+            Tensor {
+                storage: StorageHandle::new(dst),
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(out_meta),
+            }
+        } else {
+            Tensor::new(dst, result_shape)
+        }
+    }
+
+    /// Add a 1-D bias `[n]` to each row of a 2-D matrix `[m, n]`.
+    ///
+    /// Returns a new `[m, n]` tensor.  Used by `Linear::forward`.
+    pub fn add_bias(&self, bias: &Tensor) -> Tensor {
+        assert_eq!(self.ndim(), 2, "add_bias: input must be 2-D");
+        assert_eq!(bias.ndim(), 1, "add_bias: bias must be 1-D");
+        let m = self.shape()[0];
+        let n = self.shape()[1];
+        assert_eq!(
+            bias.shape()[0],
+            n,
+            "add_bias: bias length {} != input columns {}",
+            bias.shape()[0],
+            n,
+        );
+
+        let mat_c = self.contiguous();
+        let bias_c = bias.contiguous();
+        let mat_guard = mat_c.storage.data();
+        let bias_guard = bias_c.storage.data();
+
+        let mut dst = CpuBackend::zeros(m * n);
+        CpuBackend::add_bias(&mat_guard, &bias_guard, &mut dst, m, n);
+
+        let result_shape = vec![m, n];
+        drop(bias_guard);
+        drop(mat_guard);
+
+        if should_record(self, bias) {
+            let out_grad_id = context::next_grad_id();
+            let mat_gid = require_grad_id(self).unwrap_or_else(context::next_grad_id);
+            let bias_gid = require_grad_id(bias).unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(mat_gid, &self.storage);
+            let bias_version = VersionSnapshot::new(bias_gid, &bias.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(meta) = bias.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::AddBias(AddBiasBackward {
+                        input_version,
+                        bias_version,
+                        m,
+                        n,
+                    }),
+                    inputs: vec![mat_gid, bias_gid],
                     outputs: vec![out_grad_id],
                 })
             });
