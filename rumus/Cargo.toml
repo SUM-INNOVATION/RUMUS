@@ -6,3 +6,5 @@ description = "A native-Rust deep learning framework with explicit memory safety
 
 [dependencies]
 rumus-macros = { path = "../rumus-macros" }
+safetensors = "0.4"
+bytemuck = { version = "1.14", features = ["derive"] }

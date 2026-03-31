@@ -68,6 +68,9 @@ pub enum AutogradError {
     /// A `GradId` referenced during backward was not found in the
     /// [`GradientStore`].
     MissingGrad { grad_id: GradId },
+
+    /// Error during state dict load/save (shape mismatch, missing key, IO).
+    StateError { key: String, message: String },
 }
 
 impl fmt::Display for AutogradError {
@@ -101,6 +104,11 @@ impl fmt::Display for AutogradError {
                 f,
                 "autograd: gradient for GradId({}) not found in GradientStore",
                 grad_id.0,
+            ),
+            AutogradError::StateError { key, message } => write!(
+                f,
+                "state_dict: key \"{}\": {}",
+                key, message,
             ),
         }
     }

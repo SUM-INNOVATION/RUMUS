@@ -1,12 +1,15 @@
 //! The core `Module` trait for neural network layers.
 //!
-//! `Module` handles **state management** only: parameter collection and
-//! train/eval mode toggling.  `forward()` is deliberately **not** in
-//! this trait because different layers have different forward signatures
-//! (Linear takes 1 tensor, Attention takes 3, Loss takes 2, etc.).
-//! Users write `forward()` as an inherent method on their struct.
+//! `Module` handles **state management** only: parameter collection,
+//! train/eval mode toggling, and serialization via state dictionaries.
+//! `forward()` is deliberately **not** in this trait because different
+//! layers have different forward signatures.
 
+use std::collections::HashMap;
+
+use crate::autograd::AutogradError;
 use crate::nn::Parameter;
+use crate::tensor::Tensor;
 
 /// Core trait for neural network state management.
 ///
@@ -14,10 +17,6 @@ use crate::nn::Parameter;
 /// to each field's `Module` implementation.
 pub trait Module {
     /// Return clones of all learnable parameters.
-    ///
-    /// The returned `Parameter`s share storage with the module's internal
-    /// state (`Arc` refcount bump), so the optimizer can mutate weights
-    /// through the `RwLock` write guard.
     fn parameters(&self) -> Vec<Parameter>;
 
     /// Switch to training mode.
@@ -25,4 +24,34 @@ pub trait Module {
 
     /// Switch to evaluation mode.
     fn eval(&mut self) {}
+
+    /// Serialize all parameters into a flat `name → Tensor` map.
+    ///
+    /// `prefix` is the dot-path accumulated by the parent module.
+    /// For the root call, pass `""`.
+    ///
+    /// # Example output
+    ///
+    /// For an MLP with two linear layers:
+    /// ```text
+    /// "linear1.weight" → Tensor [2, 8]
+    /// "linear1.bias"   → Tensor [8]
+    /// "linear2.weight" → Tensor [8, 1]
+    /// "linear2.bias"   → Tensor [1]
+    /// ```
+    fn state_dict(&self, prefix: &str) -> HashMap<String, Tensor>;
+
+    /// Load parameters from a flat `name → Tensor` map.
+    ///
+    /// For each key matching this module's prefix, the parameter's
+    /// storage is overwritten via the `RwLock` write guard.
+    ///
+    /// Missing keys are silently skipped to support partial loading
+    /// (e.g., fine-tuning only the head of a pretrained model).
+    /// Shape mismatches return [`AutogradError::StateError`].
+    fn load_state_dict(
+        &mut self,
+        dict: &HashMap<String, Tensor>,
+        prefix: &str,
+    ) -> Result<(), AutogradError>;
 }

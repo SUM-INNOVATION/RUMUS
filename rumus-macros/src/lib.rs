@@ -1,10 +1,10 @@
 //! Procedural macros for the RUMUS deep learning framework.
 //!
 //! Provides `#[derive(Module)]` which auto-generates `parameters()`,
-//! `train()`, and `eval()` implementations by delegating to each named
-//! field's `Module` impl.  The user writes `forward()` as an inherent
-//! method — it is deliberately **not** part of the `Module` trait because
-//! different layers have different forward signatures.
+//! `train()`, `eval()`, `state_dict()`, and `load_state_dict()`
+//! implementations by delegating to each named field's `Module` impl.
+//! The user writes `forward()` as an inherent method — it is deliberately
+//! **not** part of the `Module` trait.
 
 use proc_macro::TokenStream;
 use quote::quote;
@@ -14,8 +14,9 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields};
 ///
 /// Generates:
 /// - `parameters()` — concatenates `.parameters()` from every field.
-/// - `train()` — calls `.train()` on every field.
-/// - `eval()` — calls `.eval()` on every field.
+/// - `train()` / `eval()` — delegates to every field.
+/// - `state_dict(prefix)` — recursively collects tensors with dot-path keys.
+/// - `load_state_dict(dict, prefix)` — recursively loads tensors by dot-path.
 ///
 /// # Example
 ///
@@ -34,6 +35,9 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields};
 ///     }
 /// }
 /// ```
+///
+/// Calling `model.state_dict("")` produces keys like
+/// `"linear1.weight"`, `"linear1.bias"`, `"linear2.weight"`, `"linear2.bias"`.
 #[proc_macro_derive(Module)]
 pub fn derive_module(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -71,6 +75,37 @@ pub fn derive_module(input: TokenStream) -> TokenStream {
 
             fn eval(&mut self) {
                 #( rumus::nn::Module::eval(&mut self.#field_names); )*
+            }
+
+            fn state_dict(
+                &self,
+                prefix: &str,
+            ) -> std::collections::HashMap<String, rumus::tensor::Tensor> {
+                let mut dict = std::collections::HashMap::new();
+                #(
+                    dict.extend(
+                        rumus::nn::Module::state_dict(
+                            &self.#field_names,
+                            &format!("{}{}.", prefix, stringify!(#field_names)),
+                        )
+                    );
+                )*
+                dict
+            }
+
+            fn load_state_dict(
+                &mut self,
+                dict: &std::collections::HashMap<String, rumus::tensor::Tensor>,
+                prefix: &str,
+            ) -> Result<(), rumus::autograd::AutogradError> {
+                #(
+                    rumus::nn::Module::load_state_dict(
+                        &mut self.#field_names,
+                        dict,
+                        &format!("{}{}.", prefix, stringify!(#field_names)),
+                    )?;
+                )*
+                Ok(())
             }
         }
     };
