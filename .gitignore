@@ -7,6 +7,9 @@
 *.swp
 *.swo
 
+# Internal documentation
+ARCHITECTURE.md
+
 # OS
 .DS_Store
 Thumbs.db

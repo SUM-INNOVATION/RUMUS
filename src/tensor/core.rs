@@ -330,6 +330,76 @@ impl Layout {
     pub fn offset(&self) -> usize {
         self.offset
     }
+
+    /// Return a new layout with axes `dim0` and `dim1` swapped.
+    ///
+    /// This is a pure metadata operation — shape and strides are swapped,
+    /// offset is preserved, no data is moved.  The resulting layout is
+    /// almost always non-contiguous (unless a swapped dimension has size 1).
+    ///
+    /// # Panics
+    ///
+    /// Panics if either dimension index is out of range.
+    pub fn transposed(&self, dim0: usize, dim1: usize) -> Self {
+        assert!(
+            dim0 < self.ndim() && dim1 < self.ndim(),
+            "transpose dims ({}, {}) out of range for {}-D tensor",
+            dim0,
+            dim1,
+            self.ndim(),
+        );
+        let mut shape = self.shape.clone();
+        let mut strides = self.strides.clone();
+        shape.swap(dim0, dim1);
+        strides.swap(dim0, dim1);
+        Self {
+            shape,
+            strides,
+            offset: self.offset,
+        }
+    }
+
+    /// Attempt a zero-copy reshape.
+    ///
+    /// Returns `Some(new_layout)` if the current layout is contiguous (so a
+    /// fresh set of row-major strides correctly maps the same flat data).
+    /// Returns `None` if the layout is strided — the caller must materialise
+    /// a contiguous copy first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `new_shape` has a different element count than the current
+    /// shape.
+    pub fn reshaped(&self, new_shape: Vec<usize>) -> Option<Self> {
+        let old_numel: usize = self.shape.iter().product();
+        let new_numel: usize = new_shape.iter().product();
+        assert_eq!(
+            old_numel, new_numel,
+            "cannot reshape {} elements into shape {:?} ({} elements)",
+            old_numel, new_shape, new_numel,
+        );
+        if !self.is_contiguous() {
+            return None;
+        }
+        Some(Self::contiguous_with_offset(new_shape, self.offset))
+    }
+
+    /// Build a contiguous (row-major) layout at an arbitrary storage offset.
+    fn contiguous_with_offset(shape: Vec<usize>, offset: usize) -> Self {
+        let ndim = shape.len();
+        let mut strides = vec![0usize; ndim];
+        if ndim > 0 {
+            strides[ndim - 1] = 1;
+            for i in (0..ndim - 1).rev() {
+                strides[i] = strides[i + 1] * shape[i + 1];
+            }
+        }
+        Self {
+            shape,
+            strides,
+            offset,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
