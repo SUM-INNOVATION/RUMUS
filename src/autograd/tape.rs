@@ -96,4 +96,14 @@ impl Tape {
     pub fn get(&self, id: OpId) -> Option<&TapeEntry> {
         self.entries.get(id.0)
     }
+
+    /// Consume the tape and return the entries as a `Vec`.
+    ///
+    /// Used by the backward engine: it takes ownership of the tape (via
+    /// [`context::take_tape`](crate::autograd::context::take_tape)), then
+    /// consumes it into entries to iterate in reverse.  This prevents
+    /// accidental double-backward — the tape is gone after this call.
+    pub fn into_entries(self) -> Vec<TapeEntry> {
+        self.entries
+    }
 }

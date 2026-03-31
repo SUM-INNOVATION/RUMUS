@@ -471,9 +471,14 @@ impl Layout {
 /// Gradient-tracking metadata attached to tensors that participate in the
 /// computational graph.
 ///
-/// Boxed inside [`AutogradState::Tracked`] so that inference-mode tensors
-/// pay no heap cost for this bookkeeping.
-#[derive(Debug, Clone)]
+/// Wrapped in `Arc` inside [`AutogradState::Tracked`] so that multiple
+/// `Tensor` handles referencing the same logical tensor (e.g. `y = x + x`)
+/// share a single `TensorMeta`.  This is essential for Tenet #3 (Strict
+/// Graph Edge Counting): when `x` is used as both inputs to `add`, both
+/// usages increment the **same** `total_grads` counter.
+///
+/// Inference-mode tensors pay no heap cost — the `Arc<TensorMeta>` only
+/// exists in the `Tracked` variant.
 pub struct TensorMeta {
     /// Whether this tensor requires gradient computation.
     pub requires_grad: bool,
@@ -489,12 +494,18 @@ pub struct TensorMeta {
     /// Number of **incoming gradient edges** — i.e., how many downstream
     /// operations consume this tensor as an input.
     ///
-    /// During backward the engine accumulates into this tensor's gradient
-    /// buffer once per edge.  The tensor's gradient is "ready" (and may
-    /// propagate further up the graph) only after all `total_grads`
-    /// contributions have arrived.  This is the counter the topological-sort
-    /// backward scheduler uses to decide when a node is fully reduced.
-    pub total_grads: usize,
+    /// This is an [`AtomicUsize`] because multiple forward ops may reference
+    /// the same tensor (via cloned `Arc<TensorMeta>`) and each must
+    /// increment the counter through a shared `&` reference.
+    ///
+    /// ## Ordering: `Relaxed`
+    ///
+    /// The forward pass is single-threaded per tape (one thread-local tape
+    /// per thread).  The backward pass reads this value only after the
+    /// forward pass has completed and the tape has been taken from the
+    /// thread-local — the take provides the happens-before edge.
+    /// `Relaxed` is therefore sufficient.
+    pub total_grads: AtomicUsize,
 }
 
 impl TensorMeta {
@@ -511,8 +522,21 @@ impl TensorMeta {
             creator: None,
             is_leaf: true,
             retains_grad: false,
-            total_grads: 0,
+            total_grads: AtomicUsize::new(0),
         }
+    }
+}
+
+impl fmt::Debug for TensorMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TensorMeta")
+            .field("requires_grad", &self.requires_grad)
+            .field("grad_id", &self.grad_id)
+            .field("creator", &self.creator)
+            .field("is_leaf", &self.is_leaf)
+            .field("retains_grad", &self.retains_grad)
+            .field("total_grads", &self.total_grads.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
@@ -524,15 +548,22 @@ impl TensorMeta {
 /// # Zero-allocation inference
 ///
 /// When `AutogradState` is `None`, the tensor carries **no** heap allocation
-/// for gradient metadata.  The `Box<TensorMeta>` only exists in the `Tracked`
+/// for gradient metadata.  The `Arc<TensorMeta>` only exists in the `Tracked`
 /// variant, so switching an entire model to inference mode eliminates all
 /// autograd overhead without touching the storage or layout layers.
+///
+/// # Shared metadata via `Arc`
+///
+/// `Tracked` holds an `Arc<TensorMeta>` (not `Box`), so cloning a tracked
+/// tensor shares the metadata rather than duplicating it.  This is critical
+/// for correct edge counting in graphs like `y = x + x`, where both usages
+/// of `x` must increment the same `total_grads` counter.
 #[derive(Debug, Clone)]
 pub enum AutogradState {
     /// Inference mode — no gradient tracking, no extra allocation.
     None,
-    /// Training mode — gradient metadata is heap-allocated.
-    Tracked(Box<TensorMeta>),
+    /// Training mode — gradient metadata is shared via `Arc`.
+    Tracked(Arc<TensorMeta>),
 }
 
 // ---------------------------------------------------------------------------
@@ -626,18 +657,54 @@ impl Tensor {
     /// Enable gradient tracking on this tensor, making it a leaf in the
     /// computational graph.
     ///
-    /// If the tensor is already tracked, this updates `requires_grad` without
-    /// resetting other metadata.
+    /// Creates a fresh `Arc<TensorMeta>` with a new [`GradId`] from the
+    /// thread-local autograd context.  If the tensor is already tracked,
+    /// this replaces the metadata entirely (a new Arc, new GradId).
     pub fn set_requires_grad(&mut self, requires_grad: bool) {
-        match &mut self.state {
+        match &self.state {
             AutogradState::None if requires_grad => {
-                self.state = AutogradState::Tracked(Box::new(TensorMeta::leaf(true)));
+                let grad_id = crate::autograd::context::next_grad_id();
+                let mut meta = TensorMeta::leaf(true);
+                meta.grad_id = Some(grad_id);
+                self.state = AutogradState::Tracked(Arc::new(meta));
             }
-            AutogradState::Tracked(meta) => {
-                meta.requires_grad = requires_grad;
+            AutogradState::Tracked(_) if !requires_grad => {
+                self.state = AutogradState::None;
             }
-            // requires_grad=false on an already-untracked tensor is a no-op.
-            AutogradState::None => {}
+            // Already in the requested state — no-op.
+            _ => {}
+        }
+    }
+
+    /// Access the shared [`TensorMeta`], if this tensor is tracked.
+    pub(crate) fn meta(&self) -> Option<&Arc<TensorMeta>> {
+        match &self.state {
+            AutogradState::Tracked(meta) => Some(meta),
+            AutogradState::None => None,
+        }
+    }
+
+    /// Get this tensor's [`GradId`], if tracked and assigned.
+    pub fn grad_id(&self) -> Option<GradId> {
+        match &self.state {
+            AutogradState::Tracked(meta) => meta.grad_id,
+            AutogradState::None => None,
+        }
+    }
+
+    /// Construct a tensor from raw components, with no autograd state.
+    ///
+    /// Used by the backward engine to reconstruct saved input tensors
+    /// from their `StorageHandle` + `Layout` without attaching any
+    /// gradient tracking metadata.
+    pub(crate) fn from_storage_and_layout(
+        storage: StorageHandle,
+        layout: Layout,
+    ) -> Tensor {
+        Tensor {
+            storage,
+            layout,
+            state: AutogradState::None,
         }
     }
 }

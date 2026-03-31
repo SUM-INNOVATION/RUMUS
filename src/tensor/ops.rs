@@ -1,12 +1,21 @@
 //! View operations (zero-copy) and materialising operations (allocating)
 //! on [`Tensor`].
 //!
-//! All materialising ops dispatch to the [`CpuBackend`] and return tensors
-//! with [`AutogradState::None`].  Autograd tracking will be layered on in
-//! Milestone 2.
+//! When autograd is active (at least one input has `requires_grad` and
+//! `no_grad` is not in effect), materialising ops record a [`TapeEntry`]
+//! on the thread-local tape and return a tracked output tensor.
+//! View operations always return `AutogradState::None` for now — view
+//! autograd will be added in a later milestone.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use crate::autograd::context;
+use crate::autograd::{
+    AddBackward, BackwardOp, MatmulBackward, MulBackward, TapeEntry, VersionSnapshot,
+};
 use crate::backend::{Backend, CpuBackend};
-use crate::tensor::{AutogradState, Tensor};
+use crate::tensor::{AutogradState, Layout, StorageHandle, Tensor, TensorMeta};
 
 // ---------------------------------------------------------------------------
 // View operations — zero-copy, Arc refcount bump only
@@ -112,13 +121,6 @@ impl Tensor {
 
         // Precompute suffix products of the shape so that multi-index
         // decomposition is O(ndim) per element, not O(ndim²).
-        //
-        //   suffix[d] = shape[d+1] * shape[d+2] * … * shape[ndim-1]
-        //   suffix[ndim-1] = 1
-        //
-        // This lets us decompose a linear index into coordinates via:
-        //   coord_d   = remainder / suffix[d]
-        //   remainder = remainder % suffix[d]
         let mut suffix = vec![1usize; ndim];
         for d in (0..ndim.saturating_sub(1)).rev() {
             suffix[d] = suffix[d + 1] * shape[d + 1];
@@ -146,14 +148,30 @@ impl Tensor {
 }
 
 // ---------------------------------------------------------------------------
+// Internal helpers for autograd recording
+// ---------------------------------------------------------------------------
+
+/// Check whether any input requires grad and we are not in no_grad mode.
+fn should_record(lhs: &Tensor, rhs: &Tensor) -> bool {
+    (lhs.requires_grad() || rhs.requires_grad()) && !context::is_no_grad()
+}
+
+/// Get a tensor's GradId, panicking if it is tracked but has no id
+/// (internal invariant violation).
+fn require_grad_id(t: &Tensor) -> Option<crate::tensor::GradId> {
+    t.grad_id()
+}
+
+// ---------------------------------------------------------------------------
 // Materialising operations — allocate new storage via CpuBackend
 // ---------------------------------------------------------------------------
 
 impl Tensor {
     /// Element-wise addition.  Returns a new contiguous tensor.
     ///
-    /// Both operands are made contiguous before dispatch so the backend
-    /// receives simple flat slices.
+    /// If either input requires grad (and `no_grad` is not active), the
+    /// operation is recorded on the thread-local tape and the output is
+    /// returned with `AutogradState::Tracked`.
     ///
     /// # Panics
     ///
@@ -168,13 +186,65 @@ impl Tensor {
             rhs.shape(),
         );
 
-        let lhs = self.contiguous();
-        let rhs = rhs.contiguous();
+        let lhs_c = self.contiguous();
+        let rhs_c = rhs.contiguous();
 
-        let mut dst = CpuBackend::zeros(lhs.numel());
-        CpuBackend::add(lhs.data(), rhs.data(), &mut dst);
+        let mut dst = CpuBackend::zeros(lhs_c.numel());
+        CpuBackend::add(lhs_c.data(), rhs_c.data(), &mut dst);
 
-        Tensor::new(dst, lhs.shape().to_vec())
+        let result_shape = lhs_c.shape().to_vec();
+
+        if should_record(self, rhs) {
+            let out_grad_id = context::next_grad_id();
+
+            // For inputs that are not tracked, we still need a GradId to
+            // store in the tape.  Assign one on the fly.  The backward
+            // engine will accumulate a gradient for it; the user simply
+            // won't consume it.
+            let lhs_gid = require_grad_id(self)
+                .unwrap_or_else(context::next_grad_id);
+            let rhs_gid = require_grad_id(rhs)
+                .unwrap_or_else(context::next_grad_id);
+
+            let lhs_version = VersionSnapshot::new(lhs_gid, &self.storage);
+            let rhs_version = VersionSnapshot::new(rhs_gid, &rhs.storage);
+
+            // Increment edge counts on tracked inputs.
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(meta) = rhs.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Add(AddBackward {
+                        lhs_version,
+                        rhs_version,
+                    }),
+                    inputs: vec![lhs_gid, rhs_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            let out_meta = Arc::new(TensorMeta {
+                requires_grad: true,
+                grad_id: Some(out_grad_id),
+                creator: op_id,
+                is_leaf: false,
+                retains_grad: false,
+                total_grads: AtomicUsize::new(0),
+            });
+
+            Tensor {
+                storage: StorageHandle::new(dst),
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(out_meta),
+            }
+        } else {
+            Tensor::new(dst, result_shape)
+        }
     }
 
     /// Element-wise multiplication.  Returns a new contiguous tensor.
@@ -191,13 +261,70 @@ impl Tensor {
             rhs.shape(),
         );
 
-        let lhs = self.contiguous();
-        let rhs = rhs.contiguous();
+        let lhs_c = self.contiguous();
+        let rhs_c = rhs.contiguous();
 
-        let mut dst = CpuBackend::zeros(lhs.numel());
-        CpuBackend::mul(lhs.data(), rhs.data(), &mut dst);
+        let mut dst = CpuBackend::zeros(lhs_c.numel());
+        CpuBackend::mul(lhs_c.data(), rhs_c.data(), &mut dst);
 
-        Tensor::new(dst, lhs.shape().to_vec())
+        let result_shape = lhs_c.shape().to_vec();
+
+        if should_record(self, rhs) {
+            let out_grad_id = context::next_grad_id();
+
+            let lhs_gid = require_grad_id(self)
+                .unwrap_or_else(context::next_grad_id);
+            let rhs_gid = require_grad_id(rhs)
+                .unwrap_or_else(context::next_grad_id);
+
+            let lhs_version = VersionSnapshot::new(lhs_gid, &self.storage);
+            let rhs_version = VersionSnapshot::new(rhs_gid, &rhs.storage);
+
+            // Mul backward needs saved data — keep strong StorageHandles.
+            let lhs_storage = self.storage.clone();
+            let lhs_layout = self.layout.clone();
+            let rhs_storage = rhs.storage.clone();
+            let rhs_layout = rhs.layout.clone();
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(meta) = rhs.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Mul(MulBackward {
+                        lhs_storage,
+                        lhs_layout,
+                        lhs_version,
+                        rhs_storage,
+                        rhs_layout,
+                        rhs_version,
+                    }),
+                    inputs: vec![lhs_gid, rhs_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            let out_meta = Arc::new(TensorMeta {
+                requires_grad: true,
+                grad_id: Some(out_grad_id),
+                creator: op_id,
+                is_leaf: false,
+                retains_grad: false,
+                total_grads: AtomicUsize::new(0),
+            });
+
+            Tensor {
+                storage: StorageHandle::new(dst),
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(out_meta),
+            }
+        } else {
+            Tensor::new(dst, result_shape)
+        }
     }
 
     /// Matrix multiplication (`self @ rhs`).  Returns a new contiguous tensor.
@@ -227,12 +354,71 @@ impl Tensor {
             n,
         );
 
-        let lhs = self.contiguous();
-        let rhs = rhs.contiguous();
+        let lhs_c = self.contiguous();
+        let rhs_c = rhs.contiguous();
 
         let mut dst = CpuBackend::zeros(m * n);
-        CpuBackend::matmul(lhs.data(), rhs.data(), &mut dst, m, k, n);
+        CpuBackend::matmul(lhs_c.data(), rhs_c.data(), &mut dst, m, k, n);
 
-        Tensor::new(dst, vec![m, n])
+        let result_shape = vec![m, n];
+
+        if should_record(self, rhs) {
+            let out_grad_id = context::next_grad_id();
+
+            let lhs_gid = require_grad_id(self)
+                .unwrap_or_else(context::next_grad_id);
+            let rhs_gid = require_grad_id(rhs)
+                .unwrap_or_else(context::next_grad_id);
+
+            let lhs_version = VersionSnapshot::new(lhs_gid, &self.storage);
+            let rhs_version = VersionSnapshot::new(rhs_gid, &rhs.storage);
+
+            let lhs_storage = self.storage.clone();
+            let lhs_layout = self.layout.clone();
+            let rhs_storage = rhs.storage.clone();
+            let rhs_layout = rhs.layout.clone();
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(meta) = rhs.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Matmul(MatmulBackward {
+                        lhs_storage,
+                        lhs_layout,
+                        lhs_version,
+                        rhs_storage,
+                        rhs_layout,
+                        rhs_version,
+                        m,
+                        k,
+                        n,
+                    }),
+                    inputs: vec![lhs_gid, rhs_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            let out_meta = Arc::new(TensorMeta {
+                requires_grad: true,
+                grad_id: Some(out_grad_id),
+                creator: op_id,
+                is_leaf: false,
+                retains_grad: false,
+                total_grads: AtomicUsize::new(0),
+            });
+
+            Tensor {
+                storage: StorageHandle::new(dst),
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(out_meta),
+            }
+        } else {
+            Tensor::new(dst, result_shape)
+        }
     }
 }

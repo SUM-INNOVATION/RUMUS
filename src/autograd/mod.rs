@@ -1,24 +1,30 @@
 //! Automatic differentiation engine for RUMUS.
 //!
-//! This module provides the data structures for recording a computational
-//! graph (the [`Tape`]) and accumulating gradients (the [`GradientStore`]).
-//! The actual backward traversal (Kahn's algorithm) will be built in a
-//! subsequent chunk on top of these foundations.
+//! This module provides:
+//!
+//! - **[`Tape`]** — append-only Wengert list recording the computational graph.
+//! - **[`GradientStore`]** — dumb accumulate-only gradient buffer.
+//! - **[`BackwardOp`]** — concrete enum of backward operations (no closures).
+//! - **[`backward`]** — Kahn's algorithm backward traversal.
+//! - **[`context`]** — thread-local tape, GradId generator, and `no_grad` guard.
 //!
 //! # Design tenets enforced here
 //!
-//! - **No opaque closures:** backward ops are concrete enum variants
-//!   ([`BackwardOp`]), not `Box<dyn Fn>`.  This gives us `Send + Sync`
-//!   safety and graph inspectability for free.
+//! - **No opaque closures:** backward ops are concrete enum variants,
+//!   not `Box<dyn Fn>`.  `Send + Sync` and inspectability for free.
 //! - **Dumb GradientStore:** accumulate-only; no un-broadcasting or
 //!   layout logic.  Ops own their reduction math.
 //! - **Errors over panics:** user-triggerable faults produce
 //!   [`AutogradError`], not panics.
 
+pub mod context;
+
+mod backward;
 mod backward_ops;
 mod gradient_store;
 mod tape;
 
+pub use backward::backward;
 pub use backward_ops::*;
 pub use gradient_store::*;
 pub use tape::*;
