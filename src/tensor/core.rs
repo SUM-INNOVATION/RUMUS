@@ -12,7 +12,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 // ---------------------------------------------------------------------------
 // Newtypes — zero-cost, strongly-typed identifiers
@@ -80,23 +80,28 @@ const NO_FENCE: usize = usize::MAX;
 /// # Thread Safety
 ///
 /// `StorageInner` is `Send + Sync` by construction:
-/// - `data` is only mutated through paths that hold exclusive logical access
-///   (enforced at a higher level by the version check, not by a lock here).
+/// - `data` is guarded by an [`RwLock`], allowing concurrent reads during
+///   forward/backward passes and exclusive writes for optimizer updates.
 /// - `version` and `fence` are atomics and therefore safe to access from any
 ///   thread without external synchronization.
 pub struct StorageInner {
-    /// Raw element buffer.  Currently `Vec<f32>` (CPU-only placeholder);
-    /// will be replaced by a `Backend`-generic allocation in a later milestone.
-    pub data: Vec<f32>,
+    /// Raw element buffer, guarded by a read-write lock.
+    ///
+    /// - Forward/backward passes acquire **read** locks (concurrent reads OK).
+    /// - Optimizer weight updates acquire **write** locks (exclusive access).
+    ///
+    /// The `RwLock` overhead is negligible relative to the heavy math ops
+    /// it protects, and it eliminates the need for any `unsafe` in the
+    /// optimizer path.
+    data: RwLock<Vec<f32>>,
 
     /// Monotonically increasing mutation counter.
     ///
-    /// Every in-place operation (`add_`, `zero_`, etc.) bumps this counter
-    /// **after** writing to `data`.  The autograd engine snapshots the version
-    /// when it records an operation; before executing backward it re-checks the
-    /// snapshot against the live counter.  A mismatch means the tensor was
-    /// mutated after being recorded, and backward must abort — the same
-    /// invariant PyTorch enforces with its `_version` counter.
+    /// Every in-place operation (`add_`, `zero_`, optimizer step, etc.) bumps
+    /// this counter **after** writing to `data`.  The autograd engine snapshots
+    /// the version when it records an operation; before executing backward it
+    /// re-checks the snapshot against the live counter.  A mismatch means the
+    /// tensor was mutated after being recorded, and backward must abort.
     ///
     /// ## Memory Ordering: `AcqRel`
     ///
@@ -106,23 +111,18 @@ pub struct StorageInner {
     ///   stores (including writes to `data`) are visible to any thread that
     ///   later *acquires* the new version value.
     /// - **Acquire** semantics on the same RMW mean that the bumping thread
-    ///   itself sees all prior writes from other threads (relevant if two
-    ///   in-place ops race — the second bump observes the first).
+    ///   itself sees all prior writes from other threads.
     ///
     /// Readers use [`Ordering::Acquire`] on their `load`, which pairs with the
     /// release half of the writer's `AcqRel` to form a full acquire–release
     /// chain.
     ///
-    /// ## Important: What this does *not* guarantee
+    /// ## Data-race freedom
     ///
-    /// The version counter provides **publication ordering** for the atomic
-    /// metadata itself, but it does **not** make concurrent non-atomic access
-    /// to the `Vec<f32>` data buffer race-free on its own.  Data-race freedom
-    /// on `data` is enforced by **aliasing exclusivity**: [`StorageHandle::data_mut`]
-    /// requires sole `Arc` ownership (`Arc::get_mut`), which statically
-    /// prevents any concurrent reader or writer.  The version counter is an
-    /// *autograd correctness* mechanism (detect illegal in-place mutation after
-    /// graph recording), not a synchronization primitive for `data` access.
+    /// Concurrent access to the `data` buffer is protected by the `RwLock`,
+    /// not by the version counter.  The version counter is an *autograd
+    /// correctness* mechanism (detect illegal in-place mutation after graph
+    /// recording), not a synchronization primitive for `data` access.
     version: AtomicUsize,
 
     /// Placeholder for WGPU synchronization.
@@ -136,17 +136,18 @@ pub struct StorageInner {
     ///   `data` immediately.
     /// - Any other value `v` — a [`FenceId(v)`](FenceId) that must be waited
     ///   on before the CPU touches `data`.
-    ///
-    /// Loads use `Acquire` to pair with the `Release` store that sets a new
-    /// fence, ensuring the CPU sees the kernel submission that produced the
-    /// fence before it tries to wait on it.
     fence: AtomicUsize,
 }
 
 impl fmt::Debug for StorageInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = self
+            .data
+            .read()
+            .map(|d| d.len())
+            .unwrap_or(0);
         f.debug_struct("StorageInner")
-            .field("len", &self.data.len())
+            .field("len", &len)
             .field("version", &self.version.load(Ordering::Relaxed))
             .field("fence", &self.fence.load(Ordering::Relaxed))
             .finish()
@@ -156,8 +157,8 @@ impl fmt::Debug for StorageInner {
 /// Thread-safe, reference-counted handle to a shared [`StorageInner`].
 ///
 /// Multiple [`Tensor`]s (e.g. a tensor and its view) may hold handles to the
-/// same inner storage.  The `Arc` provides shared ownership; the atomic
-/// `version` inside provides mutation tracking without locking.
+/// same inner storage.  The `Arc` provides shared ownership; the `RwLock`
+/// inside provides safe concurrent read / exclusive write access.
 #[derive(Clone, Debug)]
 pub struct StorageHandle {
     inner: Arc<StorageInner>,
@@ -170,7 +171,7 @@ impl StorageHandle {
     pub fn new(data: Vec<f32>) -> Self {
         Self {
             inner: Arc::new(StorageInner {
-                data,
+                data: RwLock::new(data),
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
             }),
@@ -189,7 +190,7 @@ impl StorageHandle {
     /// version.
     ///
     /// Must be called by every in-place mutation path **after** writing to the
-    /// data buffer.  See [`StorageInner::version`] for the ordering rationale.
+    /// data buffer and **after** dropping the write guard.
     pub fn bump_version(&self) -> usize {
         self.inner.version.fetch_add(1, Ordering::AcqRel)
     }
@@ -223,24 +224,33 @@ impl StorageHandle {
         self.inner.fence.store(NO_FENCE, Ordering::Release);
     }
 
-    /// Returns a shared reference to the underlying data buffer.
+    /// Acquire a **read** lock on the underlying data buffer.
     ///
-    /// # Safety Contract (caller-enforced)
+    /// Multiple forward/backward ops can hold read guards concurrently.
     ///
-    /// The caller must ensure no concurrent in-place mutation is in flight.
-    /// In practice this is upheld by the autograd version check and by
-    /// requiring `&mut self` on mutation paths at the `Tensor` API level.
-    pub fn data(&self) -> &[f32] {
-        &self.inner.data
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned (indicates a prior panic while a
+    /// write guard was held — an internal invariant violation).
+    pub fn data(&self) -> RwLockReadGuard<'_, Vec<f32>> {
+        self.inner.data.read().expect("StorageInner RwLock poisoned")
     }
 
-    /// Returns a mutable reference to the underlying data buffer.
+    /// Acquire an exclusive **write** lock on the underlying data buffer.
     ///
-    /// This requires an `Arc::get_mut`, which succeeds only when this
-    /// `StorageHandle` is the sole owner — i.e., no views or aliases exist.
-    /// Returns `None` if the storage is shared.
-    pub fn data_mut(&mut self) -> Option<&mut [f32]> {
-        Arc::get_mut(&mut self.inner).map(|inner| inner.data.as_mut_slice())
+    /// Used by the optimizer for in-place weight updates.  The caller
+    /// **must** call [`bump_version`](Self::bump_version) after writing
+    /// and dropping the guard to maintain the autograd version counter
+    /// invariant.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock is poisoned.
+    pub fn data_write(&self) -> RwLockWriteGuard<'_, Vec<f32>> {
+        self.inner
+            .data
+            .write()
+            .expect("StorageInner RwLock poisoned")
     }
 
     /// Create a [`WeakStorageHandle`] that does not keep the storage alive.
@@ -295,9 +305,9 @@ impl WeakStorageHandle {
     }
 }
 
-// StorageInner is Send + Sync: Vec<f32> is Send+Sync, atomics are Send+Sync.
-// The compiler derives this automatically, but we assert it here so a future
-// field addition that breaks the invariant becomes a compile error.
+// StorageInner is Send + Sync: RwLock<Vec<f32>> is Send+Sync, atomics are
+// Send+Sync.  The compiler derives this automatically, but we assert it here
+// so a future field addition that breaks the invariant becomes a compile error.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _assert_sync<T: Sync>() {}
@@ -362,8 +372,7 @@ impl Layout {
     }
 
     /// Returns `true` if the layout describes a dense, row-major block with
-    /// no gaps and no overlap — i.e., a simple `&[f32]` slice starting at
-    /// `offset` with length `numel()` covers exactly the right elements.
+    /// no gaps and no overlap.
     pub fn is_contiguous(&self) -> bool {
         if self.shape.is_empty() {
             return true;
@@ -395,10 +404,6 @@ impl Layout {
 
     /// Return a new layout with axes `dim0` and `dim1` swapped.
     ///
-    /// This is a pure metadata operation — shape and strides are swapped,
-    /// offset is preserved, no data is moved.  The resulting layout is
-    /// almost always non-contiguous (unless a swapped dimension has size 1).
-    ///
     /// # Panics
     ///
     /// Panics if either dimension index is out of range.
@@ -423,15 +428,13 @@ impl Layout {
 
     /// Attempt a zero-copy reshape.
     ///
-    /// Returns `Some(new_layout)` if the current layout is contiguous (so a
-    /// fresh set of row-major strides correctly maps the same flat data).
-    /// Returns `None` if the layout is strided — the caller must materialise
-    /// a contiguous copy first.
+    /// Returns `Some(new_layout)` if the current layout is contiguous.
+    /// Returns `None` if strided — the caller must materialise a contiguous
+    /// copy first.
     ///
     /// # Panics
     ///
-    /// Panics if `new_shape` has a different element count than the current
-    /// shape.
+    /// Panics if `new_shape` has a different element count.
     pub fn reshaped(&self, new_shape: Vec<usize>) -> Option<Self> {
         let old_numel: usize = self.shape.iter().product();
         let new_numel: usize = new_shape.iter().product();
@@ -473,48 +476,20 @@ impl Layout {
 ///
 /// Wrapped in `Arc` inside [`AutogradState::Tracked`] so that multiple
 /// `Tensor` handles referencing the same logical tensor (e.g. `y = x + x`)
-/// share a single `TensorMeta`.  This is essential for Tenet #3 (Strict
-/// Graph Edge Counting): when `x` is used as both inputs to `add`, both
-/// usages increment the **same** `total_grads` counter.
-///
-/// Inference-mode tensors pay no heap cost — the `Arc<TensorMeta>` only
-/// exists in the `Tracked` variant.
+/// share a single `TensorMeta`.
 pub struct TensorMeta {
-    /// Whether this tensor requires gradient computation.
     pub requires_grad: bool,
-    /// Handle into the gradient accumulation buffer registry.
     pub grad_id: Option<GradId>,
-    /// The operation that produced this tensor (`None` for leaf tensors).
     pub creator: Option<OpId>,
-    /// `true` if the user created this tensor directly (not via an op).
     pub is_leaf: bool,
-    /// `true` if the gradient should be retained after `backward()` even for
-    /// non-leaf tensors (mirrors `torch.Tensor.retain_grad()`).
     pub retains_grad: bool,
-    /// Number of **incoming gradient edges** — i.e., how many downstream
-    /// operations consume this tensor as an input.
-    ///
-    /// This is an [`AtomicUsize`] because multiple forward ops may reference
-    /// the same tensor (via cloned `Arc<TensorMeta>`) and each must
-    /// increment the counter through a shared `&` reference.
-    ///
-    /// ## Ordering: `Relaxed`
-    ///
-    /// The forward pass is single-threaded per tape (one thread-local tape
-    /// per thread).  The backward pass reads this value only after the
-    /// forward pass has completed and the tape has been taken from the
-    /// thread-local — the take provides the happens-before edge.
-    /// `Relaxed` is therefore sufficient.
+    /// Incoming gradient edges.  `AtomicUsize` for lock-free increment
+    /// from shared `&Tensor` references during the forward pass.
     pub total_grads: AtomicUsize,
 }
 
 impl TensorMeta {
     /// Construct metadata for a user-created leaf tensor.
-    ///
-    /// - `creator` is `None` (no parent op).
-    /// - `is_leaf` is `true`.
-    /// - `total_grads` starts at 0 and is incremented as downstream ops
-    ///   record this tensor as an input.
     pub fn leaf(requires_grad: bool) -> Self {
         Self {
             requires_grad,
@@ -542,22 +517,8 @@ impl fmt::Debug for TensorMeta {
 
 /// Controls whether a [`Tensor`] participates in automatic differentiation.
 ///
-/// This is an enum — not an `Option` — so the two states are named and
-/// self-documenting at every match site.
-///
-/// # Zero-allocation inference
-///
-/// When `AutogradState` is `None`, the tensor carries **no** heap allocation
-/// for gradient metadata.  The `Arc<TensorMeta>` only exists in the `Tracked`
-/// variant, so switching an entire model to inference mode eliminates all
-/// autograd overhead without touching the storage or layout layers.
-///
-/// # Shared metadata via `Arc`
-///
-/// `Tracked` holds an `Arc<TensorMeta>` (not `Box`), so cloning a tracked
-/// tensor shares the metadata rather than duplicating it.  This is critical
-/// for correct edge counting in graphs like `y = x + x`, where both usages
-/// of `x` must increment the same `total_grads` counter.
+/// `Tracked` holds an `Arc<TensorMeta>` so cloning a tracked tensor shares
+/// metadata rather than duplicating it — critical for correct edge counting.
 #[derive(Debug, Clone)]
 pub enum AutogradState {
     /// Inference mode — no gradient tracking, no extra allocation.
@@ -572,10 +533,9 @@ pub enum AutogradState {
 
 /// The top-level tensor type composing storage, layout, and autograd state.
 ///
-/// `Tensor` is the primary user-facing handle.  Cloning a `Tensor` is cheap:
-/// it bumps the `Arc` refcount on storage, clones the layout vectors, and
-/// clones the autograd state.
-#[derive(Clone)]
+/// Cloning a `Tensor` is cheap: it bumps the `Arc` refcount on storage,
+/// clones the layout vectors, and clones the autograd state `Arc`.
+#[derive(Clone, Debug)]
 pub struct Tensor {
     /// Shared, reference-counted raw memory.
     pub(crate) storage: StorageHandle,
@@ -587,8 +547,6 @@ pub struct Tensor {
 
 impl Tensor {
     /// Create a new contiguous, inference-mode tensor from raw data.
-    ///
-    /// The `shape` must be compatible with `data.len()`.
     ///
     /// # Panics
     ///
@@ -644,22 +602,21 @@ impl Tensor {
         }
     }
 
-    /// Current storage version counter (see [`StorageInner::version`]).
+    /// Current storage version counter.
     pub fn version(&self) -> usize {
         self.storage.version()
     }
 
-    /// Read-only access to the underlying data buffer.
-    pub fn data(&self) -> &[f32] {
+    /// Acquire a read lock on the underlying data buffer.
+    ///
+    /// The returned guard auto-derefs to `&Vec<f32>` / `&[f32]`.
+    /// The lock is released when the guard is dropped.
+    pub fn data(&self) -> RwLockReadGuard<'_, Vec<f32>> {
         self.storage.data()
     }
 
     /// Enable gradient tracking on this tensor, making it a leaf in the
     /// computational graph.
-    ///
-    /// Creates a fresh `Arc<TensorMeta>` with a new [`GradId`] from the
-    /// thread-local autograd context.  If the tensor is already tracked,
-    /// this replaces the metadata entirely (a new Arc, new GradId).
     pub fn set_requires_grad(&mut self, requires_grad: bool) {
         match &self.state {
             AutogradState::None if requires_grad => {
@@ -671,7 +628,6 @@ impl Tensor {
             AutogradState::Tracked(_) if !requires_grad => {
                 self.state = AutogradState::None;
             }
-            // Already in the requested state — no-op.
             _ => {}
         }
     }
@@ -693,10 +649,6 @@ impl Tensor {
     }
 
     /// Construct a tensor from raw components, with no autograd state.
-    ///
-    /// Used by the backward engine to reconstruct saved input tensors
-    /// from their `StorageHandle` + `Layout` without attaching any
-    /// gradient tracking metadata.
     pub(crate) fn from_storage_and_layout(
         storage: StorageHandle,
         layout: Layout,
@@ -706,32 +658,5 @@ impl Tensor {
             layout,
             state: AutogradState::None,
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Parameter
-// ---------------------------------------------------------------------------
-
-/// A learnable parameter: a [`Tensor`] paired with a globally unique
-/// [`ParamId`].
-///
-/// `Parameter` is the unit of registration in a module's parameter list and
-/// the unit the optimizer iterates over.  The `ParamId` allows the optimizer
-/// to maintain per-parameter state (momentum buffers, etc.) across calls.
-pub struct Parameter {
-    /// The underlying tensor holding the parameter's value.
-    pub tensor: Tensor,
-    /// Unique identifier for this parameter.
-    pub id: ParamId,
-}
-
-impl Parameter {
-    /// Wrap an existing tensor as a named parameter.
-    ///
-    /// `ParamId` allocation strategy is deferred to the module/optimizer
-    /// milestone — for now the caller provides the id.
-    pub fn new(tensor: Tensor, id: ParamId) -> Self {
-        Self { tensor, id }
     }
 }

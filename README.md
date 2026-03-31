@@ -18,7 +18,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 |-----------|--------|
 | **M1 — Core Memory Model & CPU Compute** | Complete |
 | **M2 — Autograd Engine** | Complete |
-| M3 — Core API, Optimizers & MVP Macros | Planned |
+| **M3 — Core API, Optimizers & MVP Macros** | In Progress |
 | M4 — WGPU Acceleration & Memory Pools | Planned |
 | M5A — Ergonomics & Polish | Planned |
 | M5B — Advanced Vision & Checkpointing | Planned |
@@ -38,6 +38,15 @@ with `AtomicUsize` edge counting for shared metadata across clones, forward-pass
 tape recording integrated into `add`/`mul`/`matmul`, and Kahn's algorithm
 backward traversal with correct dead-branch decrementing.
 
+**Milestone 3** (in progress) adds state management and optimizers:
+`StorageInner::data` migrated to `RwLock<Vec<f32>>` for safe concurrent reads
+and exclusive optimizer writes (zero `unsafe`). `Parameter` with global
+`AtomicUsize` `ParamId` allocator and auto `requires_grad`. `trait Module`
+(`forward`, `parameters`, `train`/`eval`). `trait Optimizer` with drain-on-apply
+`&mut GradientStore` pattern. `SGD` (with momentum) and `Adam` (with
+`ParamId`-keyed moment buffers and bias correction), both using explicit block
+scoping for `RwLock` write guard lifetimes.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -55,7 +64,7 @@ backward traversal with correct dead-branch decrementing.
 
 | Struct | Role |
 |--------|------|
-| `StorageHandle` | `Arc<StorageInner>` wrapping raw memory + atomic version counter + fence |
+| `StorageHandle` | `Arc<StorageInner>` wrapping `RwLock<Vec<f32>>` + atomic version counter + fence |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
 | `AutogradState` | `None` (inference) or `Tracked(Arc<TensorMeta>)` |
@@ -67,6 +76,11 @@ backward traversal with correct dead-branch decrementing.
 | `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked |
 | `BackwardOp` | Concrete enum (`Add`, `Mul`, `Matmul`) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
+| `Parameter` | `Tensor` + globally unique `ParamId` (auto `requires_grad`) |
+| `Module` trait | `forward(&self)`, `parameters()`, `train`/`eval` |
+| `Optimizer` trait | `step(&mut self, &mut GradientStore)` — drain pattern |
+| `SGD` | Vanilla + momentum, `RwLock` write guards with block scoping |
+| `Adam` | `ParamId`-keyed moment buffers, bias correction, block-scoped locks |
 
 ### Backward Engine
 
