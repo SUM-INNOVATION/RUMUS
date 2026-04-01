@@ -6,9 +6,11 @@
 //! subset from the same store (e.g., GAN generator vs. discriminator).
 
 mod adam;
+mod adamw;
 mod sgd;
 
 pub use adam::Adam;
+pub use adamw::AdamW;
 pub use sgd::SGD;
 
 use crate::autograd::{AutogradError, GradientStore};

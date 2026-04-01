@@ -115,6 +115,50 @@ struct FusedDropoutParams {
     suffix: [u32; 8],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CrossEntropyParams {
+    batch: u32,
+    num_classes: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ReduceParams {
+    numel: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AdamWParams {
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    bc1: f32,
+    bc2: f32,
+    weight_decay: f32,
+    numel: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BroadcastScaleParams {
+    numel: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<BroadcastScaleParams>() == 16);
+const _: () = assert!(std::mem::size_of::<CrossEntropyParams>() == 16);
+const _: () = assert!(std::mem::size_of::<ReduceParams>() == 16);
+const _: () = assert!(std::mem::size_of::<AdamWParams>() == 32);
 const _: () = assert!(std::mem::size_of::<FusedDropoutParams>() == 128);
 // 128 = 8 * 16 ✓
 const _: () = assert!(std::mem::size_of::<ContiguousParams>() == 112);
@@ -833,6 +877,168 @@ pub fn contiguous_copy(
     {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(&ctx.pipelines.contiguous_copy_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((numel + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Entropy Loss (forward + gradient fused, then scalar reduction)
+// ---------------------------------------------------------------------------
+
+/// Pass 1: compute per-batch loss + full gradient in one dispatch.
+/// One workgroup per batch element.
+/// Broadcast-scale: dst[i] = src[i] * scalar_buf[0].
+///
+/// Reads the scalar from a GPU storage buffer (not a host float),
+/// keeping the entire operation on-device.  Reuses `binary_layout`.
+pub fn broadcast_scale(
+    ctx: &GpuContext,
+    scalar_buf: &wgpu::Buffer,
+    src: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    numel: u32,
+) {
+    let params = BroadcastScaleParams { numel, _pad0: 0, _pad1: 0, _pad2: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("broadcast_scale_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.binary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: scalar_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.broadcast_scale_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((numel + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+pub fn cross_entropy_forward(
+    ctx: &GpuContext,
+    logits: &wgpu::Buffer,
+    targets: &wgpu::Buffer,
+    grad: &wgpu::Buffer,
+    loss_per_b: &wgpu::Buffer,
+    batch: u32,
+    num_classes: u32,
+) {
+    let params = CrossEntropyParams { batch, num_classes, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("ce_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.ce_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: logits.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: targets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: grad.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: loss_per_b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.ce_forward_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        // One workgroup per batch element.
+        pass.dispatch_workgroups(batch, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// Pass 2: reduce per-batch losses to a single scalar.
+pub fn reduce_loss(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    numel: u32,
+) {
+    let params = ReduceParams { numel, _pad0: 0, _pad1: 0, _pad2: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("reduce_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.ce_reduce_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// AdamW optimizer
+// ---------------------------------------------------------------------------
+
+/// AdamW step: fused m/v update + decoupled weight decay + gradient step.
+pub fn adamw_step(
+    ctx: &GpuContext,
+    grad: &wgpu::Buffer,
+    m: &wgpu::Buffer,
+    v: &wgpu::Buffer,
+    param: &wgpu::Buffer,
+    numel: u32,
+    lr: f32, beta1: f32, beta2: f32, epsilon: f32,
+    bc1: f32, bc2: f32, weight_decay: f32,
+) {
+    let params = AdamWParams { lr, beta1, beta2, epsilon, bc1, bc2, weight_decay, numel };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("adamw_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.adam_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: grad.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: m.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: v.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: param.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.adamw_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups((numel + 63) / 64, 1, 1);
     }

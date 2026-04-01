@@ -22,7 +22,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M4 — WGPU Acceleration & Memory Pools** | Complete |
 | **M5 — Conv2D & Advanced Layers** | Complete |
 | **M6 — Inference Mode & Dropout** | Complete |
-| M7a — Loss Functions & GPU Optimizers | Planned |
+| **M7a — Loss Functions & GPU Optimizers** | Complete |
 | M7b — The Training Loop | Planned |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
@@ -86,10 +86,13 @@ patterns and converges. `BackwardOp` enum now has 14 variants.
 locality, implemented WGSL PCG PRNG, bypassed tape recording for inference, and
 deployed a Fused Stride-Aware Kernel for Dropout to prevent VRAM bloat.
 
-**M7a — Loss Functions & GPU Optimizers (Planned):** Implement GPU-fused
-Cross-Entropy Loss (using the Log-Sum-Exp trick to prevent NaNs) and on-device
-Optimizer State Management (AdamW/SGD momentum buffers to keep weight updates
-strictly on the GPU).
+**M7a — Loss Functions & GPU Optimizers (Complete):** GPU-fused Cross-Entropy
+Loss with Log-Sum-Exp stability (workgroup shared memory reduction for max +
+sum_exp, gradient pre-computed during forward — backward is a zero-copy
+broadcast-scale via dedicated WGSL kernel). AdamW optimizer with decoupled
+weight decay, GPU-native moment buffer initialization via `clear_buffer`
+(zero host allocation), and fused WGSL update kernel. `broadcast_scale_kernel`
+for on-device scalar-tensor multiplication (no D2H for the scalar).
 
 **M7b — The Training Loop (Planned):** Orchestrate the forward pass, backward
 pass, loss computation, and optimizer updates into a unified `step()` function.

@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, DropoutBackward,
-    FlattenBackward, Im2ColBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward,
-    MulBackward, ReluBackward, ReshapeBackward, StackBackward, SubBackward, TapeEntry,
-    VersionSnapshot,
+    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, CrossEntropyBackward,
+    DropoutBackward, FlattenBackward, Im2ColBackward, MatmulBackward, MaxPool2dBackward,
+    MseLossBackward, MulBackward, ReluBackward, ReshapeBackward, StackBackward, SubBackward,
+    TapeEntry, VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
 #[cfg(feature = "gpu")]
@@ -496,6 +496,108 @@ impl Tensor {
             Tensor {
                 storage: out_storage,
                 layout: Layout::contiguous(result_shape),
+                state: AutogradState::None,
+            }
+        }
+    }
+
+    /// Cross-entropy loss with Log-Sum-Exp stability.
+    ///
+    /// `self` = logits `[B, C]`, `targets` = class indices `[B]` (as f32).
+    /// Returns scalar loss `[1]`.  Gradient is pre-computed during forward
+    /// and saved in `CrossEntropyBackward` — backward is a trivial scale.
+    pub fn cross_entropy_loss(&self, targets: &Tensor) -> Tensor {
+        assert_eq!(self.ndim(), 2, "cross_entropy_loss: logits must be 2-D [B, C]");
+        assert_eq!(targets.ndim(), 1, "cross_entropy_loss: targets must be 1-D [B]");
+        let batch = self.shape()[0];
+        let num_classes = self.shape()[1];
+        assert_eq!(targets.shape()[0], batch, "cross_entropy_loss: batch mismatch");
+
+        let logits_c = self.contiguous();
+        let targets_c = targets.contiguous();
+
+        // GPU path
+        #[cfg(feature = "gpu")]
+        let (loss_storage, grad_storage) = if self.storage.is_gpu() {
+            let ctx = GpuContext::get().expect("GPU required");
+            let lb = logits_c.storage.gpu_buffer();
+            targets_c.storage.ensure_gpu();
+            let tb = targets_c.storage.gpu_buffer();
+            let grad_buf = ctx.pool.acquire(&ctx.device, (batch * num_classes * 4) as u64, STORAGE_USAGE);
+            let loss_per_b_buf = ctx.pool.acquire(&ctx.device, (batch * 4) as u64, STORAGE_USAGE);
+            let loss_scalar_buf = ctx.pool.acquire(&ctx.device, 4u64, STORAGE_USAGE);
+
+            gpu_compute::cross_entropy_forward(
+                ctx, &lb, &tb, &grad_buf, &loss_per_b_buf,
+                batch as u32, num_classes as u32,
+            );
+            gpu_compute::reduce_loss(ctx, &loss_per_b_buf, &loss_scalar_buf, batch as u32);
+
+            drop(lb); drop(tb);
+            ctx.pool.release(loss_per_b_buf);
+
+            (StorageHandle::new_gpu(loss_scalar_buf, 1),
+             StorageHandle::new_gpu(grad_buf, batch * num_classes))
+        } else {
+            let lg = logits_c.storage.data();
+            let tg = targets_c.storage.data();
+            let mut grad = CpuBackend::zeros(batch * num_classes);
+            let mut loss_per_b = CpuBackend::zeros(batch);
+            CpuBackend::cross_entropy_forward(&lg, &tg, &mut grad, &mut loss_per_b, batch, num_classes);
+            drop(lg); drop(tg);
+            let loss_val: f32 = loss_per_b.iter().sum();
+            (StorageHandle::new(vec![loss_val]), StorageHandle::new(grad))
+        };
+
+        #[cfg(not(feature = "gpu"))]
+        let (loss_storage, grad_storage) = {
+            let lg = logits_c.storage.data();
+            let tg = targets_c.storage.data();
+            let mut grad = CpuBackend::zeros(batch * num_classes);
+            let mut loss_per_b = CpuBackend::zeros(batch);
+            CpuBackend::cross_entropy_forward(&lg, &tg, &mut grad, &mut loss_per_b, batch, num_classes);
+            drop(lg); drop(tg);
+            let loss_val: f32 = loss_per_b.iter().sum();
+            (StorageHandle::new(vec![loss_val]), StorageHandle::new(grad))
+        };
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::CrossEntropy(CrossEntropyBackward {
+                        input_version,
+                        grad_storage: grad_storage.clone(),
+                        grad_layout: Layout::contiguous(vec![batch, num_classes]),
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            Tensor {
+                storage: loss_storage,
+                layout: Layout::contiguous(vec![1]),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true,
+                    grad_id: Some(out_grad_id),
+                    creator: op_id,
+                    is_leaf: false,
+                    retains_grad: false,
+                    total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor {
+                storage: loss_storage,
+                layout: Layout::contiguous(vec![1]),
                 state: AutogradState::None,
             }
         }

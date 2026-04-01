@@ -131,4 +131,14 @@ pub trait Backend {
         src: &[f32], dst: &mut [f32], mask: &mut [f32],
         numel: usize, p: f32, step: u64,
     );
+
+    // ----- Loss ----------------------------------------------------------------
+
+    /// Cross-entropy loss forward: computes per-batch loss AND gradient in one pass.
+    /// Uses the Log-Sum-Exp trick for numerical stability.
+    fn cross_entropy_forward(
+        logits: &[f32], targets: &[f32],
+        grad: &mut [f32], loss_per_b: &mut [f32],
+        batch: usize, num_classes: usize,
+    );
 }

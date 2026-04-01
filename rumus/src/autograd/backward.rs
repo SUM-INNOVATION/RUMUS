@@ -285,6 +285,67 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 grads.accumulate(entry.inputs[0], grad_input)?;
             }
 
+            BackwardOp::CrossEntropy(bw) => {
+                bw.input_version.check()?;
+                // Gradient was pre-computed during forward as (softmax - one_hot) / B.
+                // Scale by the incoming out_grad scalar — entirely on-device.
+                let saved_grad = Tensor::from_storage_and_layout(
+                    bw.grad_storage.clone(),
+                    bw.grad_layout.clone(),
+                );
+                // out_grad is [1], saved_grad is [B, C].
+                // Broadcast-scale on GPU; CPU fallback for CPU tensors.
+                #[cfg(feature = "gpu")]
+                let grad_input = if saved_grad.storage.is_gpu() {
+                    use crate::backend::gpu::{
+                        compute as gpu_compute,
+                        context::{GpuContext, STORAGE_USAGE},
+                    };
+                    let ctx = GpuContext::get().expect("GPU required");
+                    let sg_c = saved_grad.contiguous();
+                    let og_c = out_grad.contiguous();
+                    let sg_buf = sg_c.storage.gpu_buffer();
+                    let og_buf = og_c.storage.gpu_buffer();
+                    let numel = saved_grad.numel();
+                    let dst_buf = ctx.pool.acquire(
+                        &ctx.device, (numel * 4) as u64, STORAGE_USAGE,
+                    );
+                    gpu_compute::broadcast_scale(
+                        ctx, &og_buf, &sg_buf, &dst_buf, numel as u32,
+                    );
+                    drop(sg_buf);
+                    drop(og_buf);
+                    Tensor::from_storage_and_layout(
+                        crate::tensor::StorageHandle::new_gpu(dst_buf, numel),
+                        crate::tensor::Layout::contiguous(saved_grad.shape().to_vec()),
+                    )
+                } else {
+                    // CPU path: read scalar, scale saved_grad.
+                    let og_guard = out_grad.storage.data();
+                    let scalar = og_guard[0];
+                    drop(og_guard);
+                    let sg_c = saved_grad.contiguous();
+                    let sg_guard = sg_c.storage.data();
+                    let mut dst = CpuBackend::zeros(saved_grad.numel());
+                    CpuBackend::scale(&sg_guard, &mut dst, scalar);
+                    drop(sg_guard);
+                    Tensor::new(dst, saved_grad.shape().to_vec())
+                };
+                #[cfg(not(feature = "gpu"))]
+                let grad_input = {
+                    let og_guard = out_grad.storage.data();
+                    let scalar = og_guard[0];
+                    drop(og_guard);
+                    let sg_c = saved_grad.contiguous();
+                    let sg_guard = sg_c.storage.data();
+                    let mut dst = CpuBackend::zeros(saved_grad.numel());
+                    CpuBackend::scale(&sg_guard, &mut dst, scalar);
+                    drop(sg_guard);
+                    Tensor::new(dst, saved_grad.shape().to_vec())
+                };
+                grads.accumulate(entry.inputs[0], grad_input)?;
+            }
+
             BackwardOp::Dropout(bw) => {
                 bw.input_version.check()?;
                 // ∂L/∂input = ∂L/∂output * saved_mask

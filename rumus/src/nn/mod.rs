@@ -17,7 +17,7 @@ pub use dropout::Dropout;
 pub use flatten::Flatten;
 pub use io::{load_safetensors, save_safetensors};
 pub use linear::Linear;
-pub use loss::mse_loss;
+pub use loss::{cross_entropy_loss, mse_loss};
 pub use pool::MaxPool2d;
 pub use module::Module;
 #[cfg(feature = "gpu")]

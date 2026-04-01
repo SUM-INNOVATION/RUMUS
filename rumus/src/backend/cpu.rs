@@ -231,6 +231,27 @@ impl Backend for CpuBackend {
             }
         }
     }
+
+    fn cross_entropy_forward(
+        logits: &[f32], targets: &[f32],
+        grad: &mut [f32], loss_per_b: &mut [f32],
+        batch: usize, num_classes: usize,
+    ) {
+        let inv_b = 1.0 / batch as f32;
+        for b in 0..batch {
+            let row = &logits[b * num_classes..(b + 1) * num_classes];
+            let max_z = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f32 = row.iter().map(|&z| (z - max_z).exp()).sum();
+            let log_sum_exp = max_z + sum_exp.ln();
+            let target_class = targets[b] as usize;
+            loss_per_b[b] = (-row[target_class] + log_sum_exp) * inv_b;
+            for c in 0..num_classes {
+                let softmax_c = (row[c] - max_z).exp() / sum_exp;
+                let one_hot = if c == target_class { 1.0 } else { 0.0 };
+                grad[b * num_classes + c] = (softmax_c - one_hot) * inv_b;
+            }
+        }
+    }
 }
 
 /// PCG-style hash for CPU dropout PRNG.

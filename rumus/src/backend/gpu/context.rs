@@ -41,6 +41,15 @@ pub struct PipelineCache {
     pub sgd_pipeline: wgpu::ComputePipeline,
     pub adam_layout: wgpu::BindGroupLayout,
     pub adam_pipeline: wgpu::ComputePipeline,
+    pub adamw_pipeline: wgpu::ComputePipeline,
+
+    // Cross-entropy loss
+    pub ce_layout: wgpu::BindGroupLayout,
+    pub ce_forward_pipeline: wgpu::ComputePipeline,
+    pub ce_reduce_pipeline: wgpu::ComputePipeline,
+
+    // Broadcast scale: dst[i] = src[i] * scalar_buf[0]
+    pub broadcast_scale_pipeline: wgpu::ComputePipeline,
 
     // Pool ops
     pub pool_layout: wgpu::BindGroupLayout,
@@ -166,6 +175,27 @@ impl PipelineCache {
             ),
         });
 
+        let ce_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cross_entropy"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/cross_entropy.wgsl").into(),
+            ),
+        });
+
+        let broadcast_scale_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("broadcast_scale"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/broadcast_scale.wgsl").into(),
+            ),
+        });
+
+        let adamw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("adamw"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/adamw.wgsl").into(),
+            ),
+        });
+
         let contiguous_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("contiguous"),
             source: wgpu::ShaderSource::Wgsl(
@@ -224,6 +254,18 @@ impl PipelineCache {
             ],
         });
 
+        // Cross-entropy: logits(read) + targets(read) + grad(rw) + loss_per_b(rw) + uniform
+        let ce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ce_layout"),
+            entries: &[
+                bgl_storage(0, true),
+                bgl_storage(1, true),
+                bgl_storage_rw(2),
+                bgl_storage_rw(3),
+                bgl_uniform(4),
+            ],
+        });
+
         // ---- Pipelines ---------------------------------------------------------
 
         let make_pipeline = |layout: &wgpu::BindGroupLayout,
@@ -267,6 +309,11 @@ impl PipelineCache {
         let sgd_pipeline = make_pipeline(&sgd_layout, &optim_module, "sgd_step", "sgd");
         let adam_pipeline = make_pipeline(&adam_layout, &optim_module, "adam_step", "adam");
 
+        let adamw_pipeline = make_pipeline(&adam_layout, &adamw_module, "adamw_step", "adamw");
+        let broadcast_scale_pipeline = make_pipeline(&binary_layout, &broadcast_scale_module, "broadcast_scale_kernel", "broadcast_scale");
+        let ce_forward_pipeline = make_pipeline(&ce_layout, &ce_module, "cross_entropy_forward_kernel", "ce_forward");
+        let ce_reduce_pipeline = make_pipeline(&unary_layout, &ce_module, "reduce_loss_kernel", "ce_reduce");
+
         let contiguous_copy_pipeline = make_pipeline(&unary_layout, &contiguous_module, "contiguous_copy_kernel", "contiguous_copy");
         let dropout_pipeline = make_pipeline(&pool_layout, &dropout_module, "dropout_kernel", "dropout");
         let fused_dropout_pipeline = make_pipeline(&pool_layout, &fused_dropout_module, "fused_dropout_kernel", "fused_dropout");
@@ -279,7 +326,9 @@ impl PipelineCache {
             matmul_layout, matmul_pipeline,
             bias_layout, add_bias_pipeline, sum_rows_pipeline,
             sgd_layout, sgd_pipeline,
-            adam_layout, adam_pipeline,
+            adam_layout, adam_pipeline, adamw_pipeline,
+            ce_layout, ce_forward_pipeline, ce_reduce_pipeline,
+            broadcast_scale_pipeline,
             contiguous_copy_pipeline,
             dropout_pipeline, fused_dropout_pipeline,
             pool_layout, max_pool2d_pipeline,

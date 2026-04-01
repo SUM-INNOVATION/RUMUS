@@ -231,6 +231,18 @@ pub struct FlattenBackward {
     pub original_shape: Vec<usize>,
 }
 
+/// Backward for `cross_entropy_loss(logits, targets)`.
+///
+/// The gradient was pre-computed during the forward pass (softmax - one_hot,
+/// scaled by 1/B).  Backward simply scales by the incoming `out_grad` scalar.
+#[derive(Debug)]
+pub struct CrossEntropyBackward {
+    pub input_version: VersionSnapshot,
+    /// Pre-computed gradient [B, C], saved during forward.
+    pub grad_storage: StorageHandle,
+    pub grad_layout: Layout,
+}
+
 /// Backward for `dropout(input, p)`.
 ///
 /// `∂L/∂input = ∂L/∂output * saved_mask`.
@@ -266,6 +278,7 @@ pub enum BackwardOp {
     Flatten(FlattenBackward),
     Reshape(ReshapeBackward),
     Dropout(DropoutBackward),
+    CrossEntropy(CrossEntropyBackward),
 }
 
 const _: () = {
