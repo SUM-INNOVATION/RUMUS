@@ -91,9 +91,12 @@ struct ContiguousParams {
     ndim: u32,
     offset: u32,
     _pad: u32,
-    shape: [u32; 8],
-    strides: [u32; 8],
-    suffix: [u32; 8],
+    shape_lo: [u32; 4],
+    shape_hi: [u32; 4],
+    strides_lo: [u32; 4],
+    strides_hi: [u32; 4],
+    suffix_lo: [u32; 4],
+    suffix_hi: [u32; 4],
 }
 
 // WebGPU requires uniform buffer bindings to be a multiple of 16 bytes.
@@ -110,9 +113,12 @@ struct FusedDropoutParams {
     offset: u32,
     _pad0: u32,
     _pad1: u32,
-    shape: [u32; 8],
-    strides: [u32; 8],
-    suffix: [u32; 8],
+    shape_lo: [u32; 4],
+    shape_hi: [u32; 4],
+    strides_lo: [u32; 4],
+    strides_hi: [u32; 4],
+    suffix_lo: [u32; 4],
+    suffix_hi: [u32; 4],
 }
 
 #[repr(C)]
@@ -785,14 +791,20 @@ pub fn fused_dropout_forward(
     let mut params = FusedDropoutParams {
         numel, seed, p_threshold, scale,
         ndim, offset, _pad0: 0, _pad1: 0,
-        shape: [0u32; 8],
-        strides: [0u32; 8],
-        suffix: [0u32; 8],
+        shape_lo: [0u32; 4], shape_hi: [0u32; 4],
+        strides_lo: [0u32; 4], strides_hi: [0u32; 4],
+        suffix_lo: [0u32; 4], suffix_hi: [0u32; 4],
     };
     for i in 0..ndim as usize {
-        params.shape[i] = shape[i] as u32;
-        params.strides[i] = strides[i] as u32;
-        params.suffix[i] = suffix[i] as u32;
+        if i < 4 {
+            params.shape_lo[i] = shape[i] as u32;
+            params.strides_lo[i] = strides[i] as u32;
+            params.suffix_lo[i] = suffix[i] as u32;
+        } else {
+            params.shape_hi[i - 4] = shape[i] as u32;
+            params.strides_hi[i - 4] = strides[i] as u32;
+            params.suffix_hi[i - 4] = suffix[i] as u32;
+        }
     }
 
     let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
@@ -847,14 +859,23 @@ pub fn contiguous_copy(
         ndim,
         offset,
         _pad: 0,
-        shape: [0u32; 8],
-        strides: [0u32; 8],
-        suffix: [0u32; 8],
+        shape_lo: [0u32; 4],
+        shape_hi: [0u32; 4],
+        strides_lo: [0u32; 4],
+        strides_hi: [0u32; 4],
+        suffix_lo: [0u32; 4],
+        suffix_hi: [0u32; 4],
     };
     for i in 0..ndim as usize {
-        params.shape[i] = shape[i] as u32;
-        params.strides[i] = strides[i] as u32;
-        params.suffix[i] = suffix[i] as u32;
+        if i < 4 {
+            params.shape_lo[i] = shape[i] as u32;
+            params.strides_lo[i] = strides[i] as u32;
+            params.suffix_lo[i] = suffix[i] as u32;
+        } else {
+            params.shape_hi[i - 4] = shape[i] as u32;
+            params.strides_hi[i - 4] = strides[i] as u32;
+            params.suffix_hi[i - 4] = suffix[i] as u32;
+        }
     }
 
     let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {

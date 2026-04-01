@@ -88,4 +88,13 @@ impl BufferPool {
     pub fn clear(&self) {
         self.cache.lock().clear();
     }
+
+    /// Number of buffers currently cached (across all size buckets).
+    ///
+    /// Used for leak detection: after a training loop stabilizes, this
+    /// should be bounded (one per unique size bucket, not growing with
+    /// epoch count).
+    pub fn cached_count(&self) -> usize {
+        self.cache.lock().values().map(|v| v.len()).sum()
+    }
 }

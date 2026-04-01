@@ -165,6 +165,39 @@ impl fmt::Debug for StorageInner {
     }
 }
 
+/// When the last `Arc<StorageInner>` is dropped, return any GPU buffer
+/// to the [`BufferPool`] for reuse instead of letting `wgpu` deallocate it.
+///
+/// This is the critical resource lifecycle hook that makes the pool work:
+/// intermediate tensors from forward/backward passes release their buffers
+/// back to the pool, which are then recycled by `pool.acquire()` on the
+/// next iteration — zero GPU allocation churn.
+#[cfg(feature = "gpu")]
+impl Drop for StorageInner {
+    fn drop(&mut self) {
+        // Extract the StorageData — we own it since we're being dropped.
+        let data = self.data.get_mut();
+        let placeholder = StorageData::Cpu(Vec::new());
+        let owned = std::mem::replace(data, placeholder);
+
+        match owned {
+            StorageData::Gpu { buffer, .. } => {
+                if let Some(ctx) = crate::backend::gpu::context::GpuContext::get() {
+                    ctx.pool.release(buffer);
+                }
+                // If no GPU context (shutdown), buffer drops normally.
+            }
+            StorageData::Both { gpu, .. } => {
+                if let Some(ctx) = crate::backend::gpu::context::GpuContext::get() {
+                    ctx.pool.release(gpu);
+                }
+            }
+            // Cpu / Transferring: nothing to recycle.
+            _ => {}
+        }
+    }
+}
+
 // --- StorageHandle ----------------------------------------------------------
 
 /// Thread-safe, reference-counted handle to a shared [`StorageInner`].

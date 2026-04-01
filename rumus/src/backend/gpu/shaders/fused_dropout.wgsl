@@ -1,29 +1,39 @@
 // Fused stride-aware dropout kernel.
 //
-// Combines strided input reading (from contiguous_copy) with PCG PRNG
-// dropout (from dropout) in a single pass.  Eliminates the intermediate
-// contiguous buffer allocation — reads directly from a potentially
-// non-contiguous source and writes dense output + mask.
-//
-// Bind group: input(read) + output(rw) + mask(rw) + uniform.
-// Reuses pool_layout.
+// Combines strided input reading with PCG PRNG dropout in a single pass.
+// Uses vec4<u32> packing for uniform array alignment.
 
 struct FusedDropoutParams {
-    // Dropout parameters
     numel: u32,
     seed: u32,
     p_threshold: u32,
     scale: f32,
-    // Stride parameters (from ContiguousParams)
     ndim: u32,
     offset: u32,
     _pad0: u32,
     _pad1: u32,
-    shape:   array<u32, 8>,
-    strides: array<u32, 8>,
-    suffix:  array<u32, 8>,
+    shape_lo:   vec4<u32>,
+    shape_hi:   vec4<u32>,
+    strides_lo: vec4<u32>,
+    strides_hi: vec4<u32>,
+    suffix_lo:  vec4<u32>,
+    suffix_hi:  vec4<u32>,
 }
-// 16 + 16 + 32 + 32 + 32 = 128 bytes — multiple of 16 ✓
+// 16 + 16 + 16*6 = 128 bytes ✓
+
+fn get_val(lo: vec4<u32>, hi: vec4<u32>, idx: u32) -> u32 {
+    switch idx {
+        case 0u: { return lo.x; }
+        case 1u: { return lo.y; }
+        case 2u: { return lo.z; }
+        case 3u: { return lo.w; }
+        case 4u: { return hi.x; }
+        case 5u: { return hi.y; }
+        case 6u: { return hi.z; }
+        case 7u: { return hi.w; }
+        default: { return 0u; }
+    }
+}
 
 @group(0) @binding(0) var<storage, read>       fd_input:  array<f32>;
 @group(0) @binding(1) var<storage, read_write> fd_output: array<f32>;
@@ -42,17 +52,16 @@ fn fused_dropout_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= fd_params.numel) { return; }
 
-    // Compute strided source index from dense output index.
     var src_idx = fd_params.offset;
     var remainder = i;
     for (var d: u32 = 0u; d < fd_params.ndim; d++) {
-        let dim_size = fd_params.suffix[d];
+        let dim_size = get_val(fd_params.suffix_lo, fd_params.suffix_hi, d);
+        let stride = get_val(fd_params.strides_lo, fd_params.strides_hi, d);
         let coord = remainder / dim_size;
         remainder = remainder % dim_size;
-        src_idx += coord * fd_params.strides[d];
+        src_idx += coord * stride;
     }
 
-    // PCG PRNG dropout.
     let hash = pcg_hash(fd_params.seed ^ i);
 
     if (hash < fd_params.p_threshold) {

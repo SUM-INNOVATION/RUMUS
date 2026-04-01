@@ -23,7 +23,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M5 — Conv2D & Advanced Layers** | Complete |
 | **M6 — Inference Mode & Dropout** | Complete |
 | **M7a — Loss Functions & GPU Optimizers** | Complete |
-| M7b — The Training Loop | Planned |
+| **M7b — The Training Loop** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -94,9 +94,16 @@ weight decay, GPU-native moment buffer initialization via `clear_buffer`
 (zero host allocation), and fused WGSL update kernel. `broadcast_scale_kernel`
 for on-device scalar-tensor multiplication (no D2H for the scalar).
 
-**M7b — The Training Loop (Planned):** Orchestrate the forward pass, backward
-pass, loss computation, and optimizer updates into a unified `step()` function.
-Culminates in an end-to-end GPU training sanity test on a small MLP.
+**M7b — The Training Loop (Complete):** `Trainer<O: Optimizer>` struct with
+closure-based `train_step()` — executes forward, loss read (4-byte D2H),
+backward, and optimizer update in one call. No `zero_grad()` needed (drain
+pattern clears automatically). `impl Drop for StorageInner` returns GPU buffers
+to the `BufferPool` when the last `Arc` reference drops — completes the
+allocation-free resource lifecycle. `BufferPool::cached_count()` introspection
+verifies pool recycling (`cached_count > 0` after first iteration). Fixed
+WebGPU uniform alignment (`vec4<u32>` packing). E2E tests: 3-class
+classification with AdamW + cross-entropy on CPU and GPU, Trainer API
+ergonomics, plus BufferPool recycling assertion. All 7 tests pass.
 
 ## Architecture
 
@@ -118,7 +125,7 @@ Culminates in an end-to-end GPU training sanity test on a small MLP.
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
 | `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool` |
-| `PipelineCache` | Named struct fields for 21 compute pipelines + 8 bind group layouts (no HashMap) |
+| `PipelineCache` | Named struct fields for 25 compute pipelines + 9 bind group layouts (no HashMap) |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
@@ -129,7 +136,7 @@ Culminates in an end-to-end GPU training sanity test on a small MLP.
 | `Backend` trait | Stateless associated fns (no `&self`) — `CpuBackend` is zero-sized |
 | `Tape` | Append-only Wengert list of `TapeEntry` nodes |
 | `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked |
-| `BackwardOp` | Concrete enum (15 variants) — no closures, `Send + Sync` |
+| `BackwardOp` | Concrete enum (16 variants) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
 | `Module` trait | State-only: `parameters`, `train`/`eval`, `state_dict`/`load_state_dict` — `forward` is inherent |
 | `#[derive(Module)]` | Proc macro generating all `Module` methods by iterating struct fields |
@@ -142,6 +149,8 @@ Culminates in an end-to-end GPU training sanity test on a small MLP.
 | `MaxPool2d` | f32 argmax indexing, `stride >= kernel_size`, WGSL forward+backward |
 | `Flatten` | Zero-copy tracked reshape `[B,C,H,W] → [B,C*H*W]` |
 | `Dropout` | Inverted scaling `1/(1-p)`, PCG hash PRNG (CPU+GPU), `train`/`eval` toggle |
+| `AdamW` | Decoupled weight decay, GPU-native moment init via `clear_buffer`, fused WGSL kernel |
+| `Trainer<O>` | Closure-based `train_step()`, epoch loss tracking, no `zero_grad` needed |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
