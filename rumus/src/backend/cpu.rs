@@ -165,4 +165,50 @@ impl Backend for CpuBackend {
             }
         }
     }
+
+    fn max_pool2d(
+        src: &[f32], dst: &mut [f32], indices: &mut [f32],
+        channels: usize, h: usize, w: usize,
+        k: usize, stride: usize,
+        out_h: usize, out_w: usize,
+    ) {
+        for c in 0..channels {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let out_idx = c * out_h * out_w + oh * out_w + ow;
+                    let mut max_val = f32::NEG_INFINITY;
+                    let mut max_flat = 0usize;
+                    for kh in 0..k {
+                        for kw in 0..k {
+                            let ih = oh * stride + kh;
+                            let iw = ow * stride + kw;
+                            let val = src[c * h * w + ih * w + iw];
+                            if val > max_val {
+                                max_val = val;
+                                max_flat = ih * w + iw;
+                            }
+                        }
+                    }
+                    dst[out_idx] = max_val;
+                    indices[out_idx] = max_flat as f32;
+                }
+            }
+        }
+    }
+
+    fn max_pool2d_backward(
+        out_grad: &[f32], indices: &[f32], dst: &mut [f32],
+        channels: usize, h: usize, w: usize,
+        out_h: usize, out_w: usize,
+    ) {
+        for c in 0..channels {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    let out_idx = c * out_h * out_w + oh * out_w + ow;
+                    let src_idx = indices[out_idx] as usize;
+                    dst[c * h * w + src_idx] += out_grad[out_idx];
+                }
+            }
+        }
+    }
 }

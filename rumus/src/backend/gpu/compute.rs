@@ -90,8 +90,22 @@ const _: () = assert!(std::mem::size_of::<MatmulParams>() == 16);
 const _: () = assert!(std::mem::size_of::<BiasParams>() == 16);
 const _: () = assert!(std::mem::size_of::<SgdParams>() == 16);
 const _: () = assert!(std::mem::size_of::<AdamParams>() == 32);
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaxPool2dParams {
+    channels: u32,
+    h: u32,
+    w: u32,
+    k: u32,
+    stride: u32,
+    out_h: u32,
+    out_w: u32,
+    _pad: u32,
+}
+
 const _: () = assert!(std::mem::size_of::<Im2ColParams>() == 32);
 const _: () = assert!(std::mem::size_of::<ChannelBiasParams>() == 16);
+const _: () = assert!(std::mem::size_of::<MaxPool2dParams>() == 32);
 
 // ---------------------------------------------------------------------------
 // Binary element-wise ops (add, sub, mul, relu_backward)
@@ -527,6 +541,88 @@ pub fn add_channel_bias(
     {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(&ctx.pipelines.add_channel_bias_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Pool ops
+// ---------------------------------------------------------------------------
+
+/// max_pool2d forward: [C, H, W] → values [C, out_h, out_w] + indices [C, out_h, out_w].
+pub fn max_pool2d_forward(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    indices: &wgpu::Buffer,
+    channels: u32, h: u32, w: u32,
+    k: u32, stride: u32,
+    out_h: u32, out_w: u32,
+) {
+    let params = MaxPool2dParams { channels, h, w, k, stride, out_h, out_w, _pad: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("pool_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.pool_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let total = channels * out_h * out_w;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.max_pool2d_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// max_pool2d backward: scatter out_grad to argmax positions.
+pub fn max_pool2d_backward(
+    ctx: &GpuContext,
+    out_grad: &wgpu::Buffer,
+    indices: &wgpu::Buffer,
+    grad_input: &wgpu::Buffer,
+    channels: u32, h: u32, w: u32,
+    out_h: u32, out_w: u32,
+) {
+    // Reuse MaxPool2dParams — k/stride not needed in backward but must fill struct.
+    let params = MaxPool2dParams { channels, h, w, k: 0, stride: 0, out_h, out_w, _pad: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("pool_bw_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.pool_bw_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: out_grad.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: grad_input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let total = channels * out_h * out_w;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.max_pool2d_bw_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups((total + 63) / 64, 1, 1);
     }

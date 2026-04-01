@@ -42,6 +42,12 @@ pub struct PipelineCache {
     pub adam_layout: wgpu::BindGroupLayout,
     pub adam_pipeline: wgpu::ComputePipeline,
 
+    // Pool ops
+    pub pool_layout: wgpu::BindGroupLayout,
+    pub max_pool2d_pipeline: wgpu::ComputePipeline,
+    pub pool_bw_layout: wgpu::BindGroupLayout,
+    pub max_pool2d_bw_pipeline: wgpu::ComputePipeline,
+
     // Conv ops (im2col, col2im share unary_layout; channel bias uses bias_layout)
     pub im2col_pipeline: wgpu::ComputePipeline,
     pub col2im_pipeline: wgpu::ComputePipeline,
@@ -124,10 +130,39 @@ impl PipelineCache {
             ),
         });
 
+        // Pool forward: input(read) + output(rw) + indices(rw) + uniform
+        let pool_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pool_layout"),
+            entries: &[
+                bgl_storage(0, true),
+                bgl_storage_rw(1),
+                bgl_storage_rw(2),
+                bgl_uniform(3),
+            ],
+        });
+
+        // Pool backward: out_grad(read) + indices(read) + grad_input(rw) + uniform
+        let pool_bw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pool_bw_layout"),
+            entries: &[
+                bgl_storage(0, true),
+                bgl_storage(1, true),
+                bgl_storage_rw(2),
+                bgl_uniform(3),
+            ],
+        });
+
         let optim_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("optim"),
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/optim.wgsl").into(),
+            ),
+        });
+
+        let pool_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pool"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/pool.wgsl").into(),
             ),
         });
 
@@ -204,6 +239,9 @@ impl PipelineCache {
         let sgd_pipeline = make_pipeline(&sgd_layout, &optim_module, "sgd_step", "sgd");
         let adam_pipeline = make_pipeline(&adam_layout, &optim_module, "adam_step", "adam");
 
+        let max_pool2d_pipeline = make_pipeline(&pool_layout, &pool_module, "max_pool2d_kernel", "max_pool2d");
+        let max_pool2d_bw_pipeline = make_pipeline(&pool_bw_layout, &pool_module, "max_pool2d_backward_kernel", "max_pool2d_bw");
+
         Self {
             binary_layout, add_pipeline, sub_pipeline, mul_pipeline, relu_bw_pipeline,
             unary_layout, relu_pipeline, scale_pipeline,
@@ -211,6 +249,8 @@ impl PipelineCache {
             bias_layout, add_bias_pipeline, sum_rows_pipeline,
             sgd_layout, sgd_pipeline,
             adam_layout, adam_pipeline,
+            pool_layout, max_pool2d_pipeline,
+            pool_bw_layout, max_pool2d_bw_pipeline,
             im2col_pipeline, col2im_pipeline,
             add_channel_bias_pipeline, sum_channel_bias_grad_pipeline,
         }

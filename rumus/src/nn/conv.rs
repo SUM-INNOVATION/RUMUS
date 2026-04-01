@@ -136,8 +136,9 @@ impl Conv2d {
         // stack: Vec<[C_out, num_patches]> → [batch, C_out, num_patches]
         let stacked = tensor::stack(&batch_outputs);
 
-        // Reshape to final [batch, out_channels, out_h, out_w].
-        stacked.reshape(vec![batch, self.out_channels, out_h, out_w])
+        // Tracked reshape to final [batch, out_channels, out_h, out_w].
+        // Must be tracked so the autograd chain isn't broken.
+        stacked.reshape_tracked(vec![batch, self.out_channels, out_h, out_w])
     }
 }
 

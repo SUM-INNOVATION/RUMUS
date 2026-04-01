@@ -61,8 +61,8 @@ produces exact output match.
 with mapped guards, `GpuContext` singleton, `BufferPool`, and
 lock-drop-transfer-reacquire device transfers. 5 WGSL shader modules (12 entry
 points) with all uniform structs 16-byte padded per WebGPU spec and compile-time
-`size_of` assertions. `PipelineCache` with named struct fields for 12 pipelines
-+ 6 bind group layouts. GPU dispatch integrated into all tensor ops via
+`size_of` assertions. `PipelineCache` with named struct fields (compile-time
+guarantees, no HashMap). GPU dispatch integrated into all tensor ops via
 `is_gpu()` check. Fused WGSL optimizer kernels (`adam_step`, `sgd_step`) —
 moments + weights updated in a single dispatch per parameter, zero D2H for
 weights. Backward pass stays on-device: seed gradient pushed to GPU causes the
@@ -71,15 +71,15 @@ entire backward cascade to dispatch WGSL kernels. `Tensor::to_gpu()` and
 entirely on the GPU and converges. All WGPU code feature-gated behind
 `--features gpu`.
 
-**Milestone 5** delivers Conv2D via the im2col algorithm. `im2col`, `col2im`,
-`slice_batch`, `stack`, `add_channel_bias` — all fully tracked tensor ops with
-dedicated backward implementations. `Conv2d` module forward is a pure
-mathematical script calling tracked ops (`slice_batch → im2col → matmul →
-add_channel_bias → stack → reshape`); the autograd engine handles the entire
-backward pass automatically via Kahn's traversal. `SliceBatchBackward` scatters
-gradients back to the correct batch slot, maintaining tape connectivity. WGSL
-kernels for im2col, col2im, and channel-bias ops. `BackwardOp` enum now has 11
-variants. Weight shape `[C_out, C_in*K*K]` for direct matmul with im2col columns.
+**Milestone 5** delivers full CNN support. Chunk 1: Conv2D via im2col — tracked
+`im2col`, `col2im`, `slice_batch`, `stack`, `add_channel_bias`, `reshape_tracked`
+ops with dedicated backward implementations. Chunk 2: `MaxPool2d` with f32
+argmax indexing and `stride >= kernel_size` assertion (non-atomic backward).
+Zero-copy tracked `flatten` (forward: clone storage + new layout; backward:
+reshape). `MaxPool2d`, `Flatten` modules (no learnable params). WGSL kernels for
+im2col, col2im, channel-bias, max_pool2d forward/backward. E2E CNN test: Mini-LeNet
+(Conv2d→ReLU→MaxPool2d→Flatten→Linear→ReLU→Linear) trains on synthetic spatial
+patterns and converges. `BackwardOp` enum now has 14 variants.
 
 ## Architecture
 
@@ -101,7 +101,7 @@ variants. Weight shape `[C_out, C_in*K*K]` for direct matmul with im2col columns
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
 | `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool` |
-| `PipelineCache` | Named struct fields for 16 compute pipelines + 6 bind group layouts (no HashMap) |
+| `PipelineCache` | Named struct fields for 18 compute pipelines + 8 bind group layouts (no HashMap) |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
@@ -112,7 +112,7 @@ variants. Weight shape `[C_out, C_in*K*K]` for direct matmul with im2col columns
 | `Backend` trait | Stateless associated fns (no `&self`) — `CpuBackend` is zero-sized |
 | `Tape` | Append-only Wengert list of `TapeEntry` nodes |
 | `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked |
-| `BackwardOp` | Concrete enum (11 variants) — no closures, `Send + Sync` |
+| `BackwardOp` | Concrete enum (14 variants) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
 | `Module` trait | State-only: `parameters`, `train`/`eval`, `state_dict`/`load_state_dict` — `forward` is inherent |
 | `#[derive(Module)]` | Proc macro generating all `Module` methods by iterating struct fields |
@@ -122,6 +122,8 @@ variants. Weight shape `[C_out, C_in*K*K]` for direct matmul with im2col columns
 | `Tensor::to_gpu()` | Triggers H2D transfer; `ModuleToGpu` blanket trait pushes all params |
 | `Linear` | `[in, out]` weight layout, Kaiming init, `add_bias` for 1D bias broadcasting |
 | `Conv2d` | im2col + matmul forward, `[C_out, C_in*K*K]` weight, Kaiming init, per-batch tracked loop |
+| `MaxPool2d` | f32 argmax indexing, `stride >= kernel_size`, WGSL forward+backward |
+| `Flatten` | Zero-copy tracked reshape `[B,C,H,W] → [B,C*H*W]` |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine

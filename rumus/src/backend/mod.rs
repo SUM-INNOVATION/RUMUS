@@ -99,4 +99,23 @@ pub trait Backend {
         src: &[f32], dst: &mut [f32],
         channels: usize, spatial: usize,
     );
+
+    // ----- Pooling ------------------------------------------------------------
+
+    /// Max pool 2D forward.  Operates on one batch element: `[C, H, W]`.
+    /// Writes pooled values to `dst` and argmax flat indices (as f32) to `indices`.
+    fn max_pool2d(
+        src: &[f32], dst: &mut [f32], indices: &mut [f32],
+        channels: usize, h: usize, w: usize,
+        k: usize, stride: usize,
+        out_h: usize, out_w: usize,
+    );
+
+    /// Max pool 2D backward.  Scatters `out_grad` to positions recorded in
+    /// `indices`.  `dst` must be pre-zeroed.  Safe when `stride >= k`.
+    fn max_pool2d_backward(
+        out_grad: &[f32], indices: &[f32], dst: &mut [f32],
+        channels: usize, h: usize, w: usize,
+        out_h: usize, out_w: usize,
+    );
 }

@@ -197,6 +197,40 @@ pub struct AddChannelBiasBackward {
     pub spatial: usize,
 }
 
+/// Backward for `max_pool2d(input)`.
+///
+/// Scatters `∂L/∂output` to the argmax positions saved during forward.
+#[derive(Debug)]
+pub struct MaxPool2dBackward {
+    pub input_version: VersionSnapshot,
+    /// Saved argmax indices (flat spatial offsets stored as f32).
+    pub indices_storage: StorageHandle,
+    pub indices_layout: Layout,
+    pub channels: usize,
+    pub h: usize,
+    pub w: usize,
+    pub out_h: usize,
+    pub out_w: usize,
+}
+
+/// Backward for `reshape_tracked(input, new_shape)`.
+///
+/// `∂L/∂input = reshape(∂L/∂output, original_shape)` — zero-copy.
+#[derive(Debug)]
+pub struct ReshapeBackward {
+    pub input_version: VersionSnapshot,
+    pub original_shape: Vec<usize>,
+}
+
+/// Backward for `flatten(input)`.
+///
+/// `∂L/∂input = reshape(∂L/∂output, original_shape)` — zero-copy.
+#[derive(Debug)]
+pub struct FlattenBackward {
+    pub input_version: VersionSnapshot,
+    pub original_shape: Vec<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // BackwardOp enum
 // ---------------------------------------------------------------------------
@@ -217,6 +251,9 @@ pub enum BackwardOp {
     Stack(StackBackward),
     AddChannelBias(AddChannelBiasBackward),
     SliceBatch(SliceBatchBackward),
+    MaxPool2d(MaxPool2dBackward),
+    Flatten(FlattenBackward),
+    Reshape(ReshapeBackward),
 }
 
 const _: () = {

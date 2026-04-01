@@ -237,9 +237,7 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
             BackwardOp::AddChannelBias(bw) => {
                 bw.input_version.check()?;
                 bw.bias_version.check()?;
-                // ∂L/∂src = ∂L/∂out (identity)
                 grads.accumulate(entry.inputs[0], out_grad.clone())?;
-                // ∂L/∂bias = sum over spatial per channel
                 let og_c = out_grad.contiguous();
                 let og_guard = og_c.storage.data();
                 let mut bias_grad = CpuBackend::zeros(bw.channels);
@@ -250,6 +248,41 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 drop(og_guard);
                 let grad_bias = Tensor::new(bias_grad, vec![bw.channels]);
                 grads.accumulate(entry.inputs[1], grad_bias)?;
+            }
+
+            BackwardOp::MaxPool2d(bw) => {
+                bw.input_version.check()?;
+                let indices = Tensor::from_storage_and_layout(
+                    bw.indices_storage.clone(),
+                    bw.indices_layout.clone(),
+                );
+                let idx_c = indices.contiguous();
+                let og_c = out_grad.contiguous();
+                let idx_guard = idx_c.storage.data();
+                let og_guard = og_c.storage.data();
+                let input_numel = bw.channels * bw.h * bw.w;
+                let mut dst = CpuBackend::zeros(input_numel);
+                CpuBackend::max_pool2d_backward(
+                    &og_guard, &idx_guard, &mut dst,
+                    bw.channels, bw.h, bw.w,
+                    bw.out_h, bw.out_w,
+                );
+                drop(idx_guard);
+                drop(og_guard);
+                let grad_input = Tensor::new(dst, vec![bw.channels, bw.h, bw.w]);
+                grads.accumulate(entry.inputs[0], grad_input)?;
+            }
+
+            BackwardOp::Flatten(bw) => {
+                bw.input_version.check()?;
+                let grad_input = out_grad.reshape(bw.original_shape.clone());
+                grads.accumulate(entry.inputs[0], grad_input)?;
+            }
+
+            BackwardOp::Reshape(bw) => {
+                bw.input_version.check()?;
+                let grad_input = out_grad.reshape(bw.original_shape.clone());
+                grads.accumulate(entry.inputs[0], grad_input)?;
             }
         }
 

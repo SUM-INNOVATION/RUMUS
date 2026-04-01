@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, Im2ColBackward,
-    MatmulBackward, MseLossBackward, MulBackward, ReluBackward, StackBackward, SubBackward,
-    TapeEntry, VersionSnapshot,
+    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, FlattenBackward,
+    Im2ColBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward, MulBackward,
+    ReluBackward, ReshapeBackward, StackBackward, SubBackward, TapeEntry, VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
 #[cfg(feature = "gpu")]
@@ -741,6 +741,210 @@ impl Tensor {
             Tensor {
                 storage: out_storage,
                 layout: Layout::contiguous(result_shape),
+                state: AutogradState::None,
+            }
+        }
+    }
+
+    /// 2D max pooling over `[C, H, W]` spatial dimensions.
+    ///
+    /// Input shape: `[C, H, W]` (single batch element).
+    /// Output shape: `[C, out_h, out_w]`.
+    ///
+    /// Saves argmax indices (as f32) for the backward pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stride < kernel_size` (overlapping windows require atomic
+    /// scatter in the backward WGSL kernel — deferred to a future milestone).
+    pub fn max_pool2d(&self, kernel_size: usize, stride: usize) -> Tensor {
+        assert_eq!(self.ndim(), 3, "max_pool2d: input must be 3-D [C, H, W]");
+        assert!(
+            stride >= kernel_size,
+            "max_pool2d: stride ({}) must be >= kernel_size ({}) for non-atomic backward",
+            stride, kernel_size,
+        );
+
+        let channels = self.shape()[0];
+        let h = self.shape()[1];
+        let w = self.shape()[2];
+        let out_h = (h - kernel_size) / stride + 1;
+        let out_w = (w - kernel_size) / stride + 1;
+        let out_numel = channels * out_h * out_w;
+
+        let input_c = self.contiguous();
+        let in_guard = input_c.storage.data();
+        let mut dst = CpuBackend::zeros(out_numel);
+        let mut indices = CpuBackend::zeros(out_numel);
+        CpuBackend::max_pool2d(
+            &in_guard, &mut dst, &mut indices,
+            channels, h, w, kernel_size, stride, out_h, out_w,
+        );
+        drop(in_guard);
+
+        let out_storage = StorageHandle::new(dst);
+        let indices_tensor = Tensor::new(indices, vec![channels, out_h, out_w]);
+        let result_shape = vec![channels, out_h, out_w];
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::MaxPool2d(MaxPool2dBackward {
+                        input_version,
+                        indices_storage: indices_tensor.storage.clone(),
+                        indices_layout: Layout::contiguous(vec![channels, out_h, out_w]),
+                        channels, h, w, out_h, out_w,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true,
+                    grad_id: Some(out_grad_id),
+                    creator: op_id,
+                    is_leaf: false,
+                    retains_grad: false,
+                    total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::None,
+            }
+        }
+    }
+
+    /// Zero-copy tracked reshape.
+    ///
+    /// Like `reshape`, but preserves autograd tracking.  The backward pass
+    /// simply reshapes the gradient back to the original shape.
+    ///
+    /// Use this when reshaping a tracked tensor in a differentiable graph
+    /// (e.g., at the end of Conv2d forward).
+    pub fn reshape_tracked(&self, new_shape: Vec<usize>) -> Tensor {
+        let old_numel: usize = self.shape().iter().product();
+        let new_numel: usize = new_shape.iter().product();
+        assert_eq!(old_numel, new_numel, "reshape_tracked: numel mismatch");
+
+        // Ensure contiguous so new layout is valid over the same storage.
+        let input_c = if self.is_contiguous() {
+            self.clone()
+        } else {
+            self.contiguous()
+        };
+
+        let out_storage = input_c.storage.clone();
+        let out_layout = Layout::contiguous(new_shape.clone());
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Reshape(ReshapeBackward {
+                        input_version,
+                        original_shape: self.shape().to_vec(),
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: out_layout,
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true,
+                    grad_id: Some(out_grad_id),
+                    creator: op_id,
+                    is_leaf: false,
+                    retains_grad: false,
+                    total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor {
+                storage: out_storage,
+                layout: out_layout,
+                state: AutogradState::None,
+            }
+        }
+    }
+
+    /// Flatten all dimensions after the first into a single dimension.
+    ///
+    /// Input shape: `[batch, d1, d2, ...]`.
+    /// Output shape: `[batch, d1*d2*...]`.
+    ///
+    /// **Zero-copy** — clones the `StorageHandle` and computes a flat `Layout`.
+    /// The backward pass is also zero-copy (reshape the gradient back).
+    pub fn flatten(&self) -> Tensor {
+        assert!(self.ndim() >= 2, "flatten: need at least 2 dims");
+        let batch = self.shape()[0];
+        let rest: usize = self.shape()[1..].iter().product();
+        let result_shape = vec![batch, rest];
+
+        // Zero-copy: clone storage, compute flat layout.
+        let out_storage = self.storage.clone();
+        let out_layout = Layout::contiguous(result_shape.clone());
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Flatten(FlattenBackward {
+                        input_version,
+                        original_shape: self.shape().to_vec(),
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: out_layout,
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true,
+                    grad_id: Some(out_grad_id),
+                    creator: op_id,
+                    is_leaf: false,
+                    retains_grad: false,
+                    total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor {
+                storage: out_storage,
+                layout: out_layout,
                 state: AutogradState::None,
             }
         }
