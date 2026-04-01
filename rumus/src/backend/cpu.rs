@@ -211,4 +211,32 @@ impl Backend for CpuBackend {
             }
         }
     }
+
+    fn dropout(
+        src: &[f32], dst: &mut [f32], mask: &mut [f32],
+        numel: usize, p: f32, step: u64,
+    ) {
+        let scale = 1.0 / (1.0 - p);
+        let seed = step as u32;
+        for i in 0..numel {
+            let hash = pcg_hash_cpu(seed ^ (i as u32));
+            // Map upper bits to [0, 1) and compare against p.
+            let u = (hash >> 8) as f32 / (1u32 << 24) as f32;
+            if u < p {
+                dst[i] = 0.0;
+                mask[i] = 0.0;
+            } else {
+                dst[i] = src[i] * scale;
+                mask[i] = scale;
+            }
+        }
+    }
+}
+
+/// PCG-style hash for CPU dropout PRNG.
+fn pcg_hash_cpu(input: u32) -> u32 {
+    let mut state = input;
+    state = state.wrapping_mul(747796405).wrapping_add(2891336453);
+    state = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277803737);
+    (state >> 22) ^ state
 }

@@ -2,6 +2,7 @@
 
 mod activations;
 mod conv;
+mod dropout;
 mod flatten;
 mod io;
 mod linear;
@@ -12,6 +13,7 @@ mod pool;
 
 pub use activations::relu;
 pub use conv::Conv2d;
+pub use dropout::Dropout;
 pub use flatten::Flatten;
 pub use io::{load_safetensors, save_safetensors};
 pub use linear::Linear;

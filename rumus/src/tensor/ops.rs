@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, FlattenBackward,
-    Im2ColBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward, MulBackward,
-    ReluBackward, ReshapeBackward, StackBackward, SubBackward, TapeEntry, VersionSnapshot,
+    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, DropoutBackward,
+    FlattenBackward, Im2ColBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward,
+    MulBackward, ReluBackward, ReshapeBackward, StackBackward, SubBackward, TapeEntry,
+    VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
 #[cfg(feature = "gpu")]
@@ -66,13 +67,35 @@ impl Tensor {
         let strides = self.layout.strides();
         let offset = self.layout.offset();
         let ndim = self.ndim();
-        let src_guard = self.storage.data();
 
+        // Precompute suffix products (shared by CPU and GPU paths).
         let mut suffix = vec![1usize; ndim];
         for d in (0..ndim.saturating_sub(1)).rev() {
             suffix[d] = suffix[d + 1] * shape[d + 1];
         }
 
+        // GPU path: strided copy entirely on-device via WGSL kernel.
+        #[cfg(feature = "gpu")]
+        if self.storage.is_gpu() {
+            let ctx = GpuContext::get().expect("GPU required");
+            let src_buf = self.storage.gpu_buffer();
+            let dst_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+            gpu_compute::contiguous_copy(
+                ctx, &src_buf, &dst_buf,
+                numel as u32, ndim as u32, offset as u32,
+                shape, strides, &suffix,
+            );
+            drop(src_buf);
+            let result_shape = shape.to_vec();
+            return Tensor {
+                storage: StorageHandle::new_gpu(dst_buf, numel),
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::None,
+            };
+        }
+
+        // CPU path: strided copy via indexed reads.
+        let src_guard = self.storage.data();
         let mut dst = vec![0.0f32; numel];
         for dst_idx in 0..numel {
             let mut src_idx = offset;
@@ -85,7 +108,6 @@ impl Tensor {
             }
             dst[dst_idx] = src_guard[src_idx];
         }
-
         drop(src_guard);
         Tensor::new(dst, shape.to_vec())
     }
@@ -887,6 +909,113 @@ impl Tensor {
             Tensor {
                 storage: out_storage,
                 layout: out_layout,
+                state: AutogradState::None,
+            }
+        }
+    }
+
+    /// Apply dropout: randomly zero elements with probability `p` and scale
+    /// survivors by `1 / (1 - p)` (inverted dropout).
+    ///
+    /// Saves the mask for backward.  The backward is simply
+    /// `out_grad * saved_mask` — reuses the existing `mul` dispatch.
+    ///
+    /// `step` is a monotonically increasing counter for PRNG seeding.
+    pub fn dropout(&self, p: f32) -> Tensor {
+        use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
+        static DROPOUT_STEP: AtomicU64 = AtomicU64::new(0);
+
+        assert!(p >= 0.0 && p < 1.0, "dropout: p must be in [0, 1)");
+        let numel = self.numel();
+        let step = DROPOUT_STEP.fetch_add(1, AtOrd::Relaxed);
+        let result_shape = self.shape().to_vec();
+
+        // --- GPU path: fused stride-aware dropout — zero intermediate alloc ---
+        #[cfg(feature = "gpu")]
+        let (out_storage, mask_storage) = if self.storage.is_gpu() {
+            let ctx = GpuContext::get().expect("GPU required");
+            let ib = self.storage.gpu_buffer();
+            let out_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+            let mask_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+
+            let shape = self.layout.shape();
+            let strides = self.layout.strides();
+            let offset = self.layout.offset();
+            let ndim = self.ndim();
+
+            let mut suffix = vec![1usize; ndim];
+            for d in (0..ndim.saturating_sub(1)).rev() {
+                suffix[d] = suffix[d + 1] * shape[d + 1];
+            }
+
+            gpu_compute::fused_dropout_forward(
+                ctx, &ib, &out_buf, &mask_buf,
+                numel as u32, step as u32, p,
+                ndim as u32, offset as u32,
+                shape, strides, &suffix,
+            );
+            drop(ib);
+            (StorageHandle::new_gpu(out_buf, numel),
+             StorageHandle::new_gpu(mask_buf, numel))
+        } else {
+            let input_c = self.contiguous();
+            let in_guard = input_c.storage.data();
+            let mut dst = CpuBackend::zeros(numel);
+            let mut mask_data = CpuBackend::zeros(numel);
+            CpuBackend::dropout(&in_guard, &mut dst, &mut mask_data, numel, p, step);
+            drop(in_guard);
+            (StorageHandle::new(dst), StorageHandle::new(mask_data))
+        };
+
+        // --- CPU-only path ---
+        #[cfg(not(feature = "gpu"))]
+        let (out_storage, mask_storage) = {
+            let input_c = self.contiguous();
+            let in_guard = input_c.storage.data();
+            let mut dst = CpuBackend::zeros(numel);
+            let mut mask_data = CpuBackend::zeros(numel);
+            CpuBackend::dropout(&in_guard, &mut dst, &mut mask_data, numel, p, step);
+            drop(in_guard);
+            (StorageHandle::new(dst), StorageHandle::new(mask_data))
+        };
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Dropout(DropoutBackward {
+                        input_version,
+                        mask_storage: mask_storage.clone(),
+                        mask_layout: Layout::contiguous(self.shape().to_vec()),
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true,
+                    grad_id: Some(out_grad_id),
+                    creator: op_id,
+                    is_leaf: false,
+                    retains_grad: false,
+                    total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
                 state: AutogradState::None,
             }
         }

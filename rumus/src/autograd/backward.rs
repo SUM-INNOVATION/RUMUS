@@ -284,6 +284,18 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 let grad_input = out_grad.reshape(bw.original_shape.clone());
                 grads.accumulate(entry.inputs[0], grad_input)?;
             }
+
+            BackwardOp::Dropout(bw) => {
+                bw.input_version.check()?;
+                // ∂L/∂input = ∂L/∂output * saved_mask
+                // Reuses existing mul dispatch (auto CPU/GPU).
+                let saved_mask = Tensor::from_storage_and_layout(
+                    bw.mask_storage.clone(),
+                    bw.mask_layout.clone(),
+                );
+                let grad_input = out_grad.mul(&saved_mask);
+                grads.accumulate(entry.inputs[0], grad_input)?;
+            }
         }
 
         for &input_id in &entry.inputs {

@@ -118,4 +118,17 @@ pub trait Backend {
         channels: usize, h: usize, w: usize,
         out_h: usize, out_w: usize,
     );
+
+    // ----- Dropout -------------------------------------------------------------
+
+    /// Generate a dropout mask and apply it to `src`.
+    ///
+    /// `mask[i]` is `0.0` (dropped) or `1.0 / (1.0 - p)` (kept, scaled).
+    /// `dst[i] = src[i] * mask[i]`.
+    ///
+    /// `step` is a monotonically increasing counter for PRNG seeding.
+    fn dropout(
+        src: &[f32], dst: &mut [f32], mask: &mut [f32],
+        numel: usize, p: f32, step: u64,
+    );
 }

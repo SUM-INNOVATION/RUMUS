@@ -48,6 +48,13 @@ pub struct PipelineCache {
     pub pool_bw_layout: wgpu::BindGroupLayout,
     pub max_pool2d_bw_pipeline: wgpu::ComputePipeline,
 
+    // Contiguous copy (reuses unary_layout: src(read) + dst(rw) + uniform)
+    pub contiguous_copy_pipeline: wgpu::ComputePipeline,
+
+    // Dropout (reuses pool_layout: input(read) + output(rw) + mask(rw) + uniform)
+    pub dropout_pipeline: wgpu::ComputePipeline,
+    pub fused_dropout_pipeline: wgpu::ComputePipeline,
+
     // Conv ops (im2col, col2im share unary_layout; channel bias uses bias_layout)
     pub im2col_pipeline: wgpu::ComputePipeline,
     pub col2im_pipeline: wgpu::ComputePipeline,
@@ -159,6 +166,27 @@ impl PipelineCache {
             ),
         });
 
+        let contiguous_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("contiguous"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/contiguous.wgsl").into(),
+            ),
+        });
+
+        let dropout_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("dropout"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/dropout.wgsl").into(),
+            ),
+        });
+
+        let fused_dropout_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fused_dropout"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/fused_dropout.wgsl").into(),
+            ),
+        });
+
         let pool_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pool"),
             source: wgpu::ShaderSource::Wgsl(
@@ -239,6 +267,9 @@ impl PipelineCache {
         let sgd_pipeline = make_pipeline(&sgd_layout, &optim_module, "sgd_step", "sgd");
         let adam_pipeline = make_pipeline(&adam_layout, &optim_module, "adam_step", "adam");
 
+        let contiguous_copy_pipeline = make_pipeline(&unary_layout, &contiguous_module, "contiguous_copy_kernel", "contiguous_copy");
+        let dropout_pipeline = make_pipeline(&pool_layout, &dropout_module, "dropout_kernel", "dropout");
+        let fused_dropout_pipeline = make_pipeline(&pool_layout, &fused_dropout_module, "fused_dropout_kernel", "fused_dropout");
         let max_pool2d_pipeline = make_pipeline(&pool_layout, &pool_module, "max_pool2d_kernel", "max_pool2d");
         let max_pool2d_bw_pipeline = make_pipeline(&pool_bw_layout, &pool_module, "max_pool2d_backward_kernel", "max_pool2d_bw");
 
@@ -249,6 +280,8 @@ impl PipelineCache {
             bias_layout, add_bias_pipeline, sum_rows_pipeline,
             sgd_layout, sgd_pipeline,
             adam_layout, adam_pipeline,
+            contiguous_copy_pipeline,
+            dropout_pipeline, fused_dropout_pipeline,
             pool_layout, max_pool2d_pipeline,
             pool_bw_layout, max_pool2d_bw_pipeline,
             im2col_pipeline, col2im_pipeline,

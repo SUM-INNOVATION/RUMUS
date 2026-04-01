@@ -231,6 +231,17 @@ pub struct FlattenBackward {
     pub original_shape: Vec<usize>,
 }
 
+/// Backward for `dropout(input, p)`.
+///
+/// `∂L/∂input = ∂L/∂output * saved_mask`.
+/// Reuses the existing `mul` dispatch (auto CPU/GPU).
+#[derive(Debug)]
+pub struct DropoutBackward {
+    pub input_version: VersionSnapshot,
+    pub mask_storage: StorageHandle,
+    pub mask_layout: Layout,
+}
+
 // ---------------------------------------------------------------------------
 // BackwardOp enum
 // ---------------------------------------------------------------------------
@@ -254,6 +265,7 @@ pub enum BackwardOp {
     MaxPool2d(MaxPool2dBackward),
     Flatten(FlattenBackward),
     Reshape(ReshapeBackward),
+    Dropout(DropoutBackward),
 }
 
 const _: () = {

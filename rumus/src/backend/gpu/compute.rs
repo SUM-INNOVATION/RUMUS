@@ -84,7 +84,41 @@ struct ChannelBiasParams {
     _pad1: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ContiguousParams {
+    numel: u32,
+    ndim: u32,
+    offset: u32,
+    _pad: u32,
+    shape: [u32; 8],
+    strides: [u32; 8],
+    suffix: [u32; 8],
+}
+
 // WebGPU requires uniform buffer bindings to be a multiple of 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FusedDropoutParams {
+    // Dropout
+    numel: u32,
+    seed: u32,
+    p_threshold: u32,
+    scale: f32,
+    // Stride
+    ndim: u32,
+    offset: u32,
+    _pad0: u32,
+    _pad1: u32,
+    shape: [u32; 8],
+    strides: [u32; 8],
+    suffix: [u32; 8],
+}
+
+const _: () = assert!(std::mem::size_of::<FusedDropoutParams>() == 128);
+// 128 = 8 * 16 ✓
+const _: () = assert!(std::mem::size_of::<ContiguousParams>() == 112);
+// 112 = 7 * 16 ✓
 const _: () = assert!(std::mem::size_of::<ElementwiseParams>() == 16);
 const _: () = assert!(std::mem::size_of::<MatmulParams>() == 16);
 const _: () = assert!(std::mem::size_of::<BiasParams>() == 16);
@@ -103,9 +137,19 @@ struct MaxPool2dParams {
     _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DropoutParams {
+    numel: u32,
+    seed: u32,
+    p_threshold: u32,
+    scale: f32,
+}
+
 const _: () = assert!(std::mem::size_of::<Im2ColParams>() == 32);
 const _: () = assert!(std::mem::size_of::<ChannelBiasParams>() == 16);
 const _: () = assert!(std::mem::size_of::<MaxPool2dParams>() == 32);
+const _: () = assert!(std::mem::size_of::<DropoutParams>() == 16);
 
 // ---------------------------------------------------------------------------
 // Binary element-wise ops (add, sub, mul, relu_backward)
@@ -625,6 +669,172 @@ pub fn max_pool2d_backward(
         pass.set_pipeline(&ctx.pipelines.max_pool2d_bw_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Dropout
+// ---------------------------------------------------------------------------
+
+/// Dropout forward: generate PCG mask and apply to input.
+/// Reuses pool_layout: input(read) + output(rw) + mask(rw) + uniform.
+pub fn dropout_forward(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    mask: &wgpu::Buffer,
+    numel: u32,
+    seed: u32,
+    p: f32,
+) {
+    let scale = 1.0 / (1.0 - p);
+    let p_threshold = (p * u32::MAX as f32) as u32;
+    let params = DropoutParams { numel, seed, p_threshold, scale };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("dropout_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.pool_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: mask.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.dropout_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((numel + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// Fused stride-aware dropout: reads directly from a potentially
+/// non-contiguous source buffer, applies PCG dropout, writes dense
+/// output + mask.  Zero intermediate allocation.
+pub fn fused_dropout_forward(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    mask: &wgpu::Buffer,
+    numel: u32,
+    seed: u32,
+    p: f32,
+    ndim: u32,
+    offset: u32,
+    shape: &[usize],
+    strides: &[usize],
+    suffix: &[usize],
+) {
+    let scale = 1.0 / (1.0 - p);
+    let p_threshold = (p * u32::MAX as f32) as u32;
+
+    let mut params = FusedDropoutParams {
+        numel, seed, p_threshold, scale,
+        ndim, offset, _pad0: 0, _pad1: 0,
+        shape: [0u32; 8],
+        strides: [0u32; 8],
+        suffix: [0u32; 8],
+    };
+    for i in 0..ndim as usize {
+        params.shape[i] = shape[i] as u32;
+        params.strides[i] = strides[i] as u32;
+        params.suffix[i] = suffix[i] as u32;
+    }
+
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("fused_dropout_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.pool_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: mask.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.fused_dropout_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((numel + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Contiguous copy (strided → dense, on-device)
+// ---------------------------------------------------------------------------
+
+/// Copy a strided GPU tensor to a dense contiguous GPU buffer.
+///
+/// Entirely on-device — no D2H transfer.  Uses the `contiguous_copy_kernel`
+/// WGSL shader which decomposes each output index into a multi-index via
+/// precomputed suffix products and reads from the strided source.
+pub fn contiguous_copy(
+    ctx: &GpuContext,
+    src: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    numel: u32,
+    ndim: u32,
+    offset: u32,
+    shape: &[usize],
+    strides: &[usize],
+    suffix: &[usize],
+) {
+    let mut params = ContiguousParams {
+        numel,
+        ndim,
+        offset,
+        _pad: 0,
+        shape: [0u32; 8],
+        strides: [0u32; 8],
+        suffix: [0u32; 8],
+    };
+    for i in 0..ndim as usize {
+        params.shape[i] = shape[i] as u32;
+        params.strides[i] = strides[i] as u32;
+        params.suffix[i] = suffix[i] as u32;
+    }
+
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("contiguous_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.contiguous_copy_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((numel + 63) / 64, 1, 1);
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
 }

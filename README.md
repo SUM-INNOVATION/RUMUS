@@ -21,8 +21,9 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M3 — Core API, Optimizers & MVP Macros** | Complete |
 | **M4 — WGPU Acceleration & Memory Pools** | Complete |
 | **M5 — Conv2D & Advanced Layers** | Complete |
-| M6A — Ergonomics & Polish | Planned |
-| M6B — Checkpointing & Memory Efficiency | Planned |
+| **M6 — Inference Mode & Dropout** | Complete |
+| M7a — Loss Functions & GPU Optimizers | Planned |
+| M7b — The Training Loop | Planned |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -81,6 +82,19 @@ im2col, col2im, channel-bias, max_pool2d forward/backward. E2E CNN test: Mini-Le
 (Conv2d→ReLU→MaxPool2d→Flatten→Linear→ReLU→Linear) trains on synthetic spatial
 patterns and converges. `BackwardOp` enum now has 14 variants.
 
+**M6 — Inference Mode & Dropout (Complete):** Achieved zero-copy GPU memory
+locality, implemented WGSL PCG PRNG, bypassed tape recording for inference, and
+deployed a Fused Stride-Aware Kernel for Dropout to prevent VRAM bloat.
+
+**M7a — Loss Functions & GPU Optimizers (Planned):** Implement GPU-fused
+Cross-Entropy Loss (using the Log-Sum-Exp trick to prevent NaNs) and on-device
+Optimizer State Management (AdamW/SGD momentum buffers to keep weight updates
+strictly on the GPU).
+
+**M7b — The Training Loop (Planned):** Orchestrate the forward pass, backward
+pass, loss computation, and optimizer updates into a unified `step()` function.
+Culminates in an end-to-end GPU training sanity test on a small MLP.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -101,7 +115,7 @@ patterns and converges. `BackwardOp` enum now has 14 variants.
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
 | `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool` |
-| `PipelineCache` | Named struct fields for 18 compute pipelines + 8 bind group layouts (no HashMap) |
+| `PipelineCache` | Named struct fields for 21 compute pipelines + 8 bind group layouts (no HashMap) |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
@@ -112,7 +126,7 @@ patterns and converges. `BackwardOp` enum now has 14 variants.
 | `Backend` trait | Stateless associated fns (no `&self`) — `CpuBackend` is zero-sized |
 | `Tape` | Append-only Wengert list of `TapeEntry` nodes |
 | `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked |
-| `BackwardOp` | Concrete enum (14 variants) — no closures, `Send + Sync` |
+| `BackwardOp` | Concrete enum (15 variants) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
 | `Module` trait | State-only: `parameters`, `train`/`eval`, `state_dict`/`load_state_dict` — `forward` is inherent |
 | `#[derive(Module)]` | Proc macro generating all `Module` methods by iterating struct fields |
@@ -124,6 +138,7 @@ patterns and converges. `BackwardOp` enum now has 14 variants.
 | `Conv2d` | im2col + matmul forward, `[C_out, C_in*K*K]` weight, Kaiming init, per-batch tracked loop |
 | `MaxPool2d` | f32 argmax indexing, `stride >= kernel_size`, WGSL forward+backward |
 | `Flatten` | Zero-copy tracked reshape `[B,C,H,W] → [B,C*H*W]` |
+| `Dropout` | Inverted scaling `1/(1-p)`, PCG hash PRNG (CPU+GPU), `train`/`eval` toggle |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
