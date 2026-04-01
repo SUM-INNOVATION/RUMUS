@@ -19,7 +19,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M1 — Core Memory Model & CPU Compute** | Complete |
 | **M2 — Autograd Engine** | Complete |
 | **M3 — Core API, Optimizers & MVP Macros** | Complete |
-| **M4 — WGPU Acceleration & Memory Pools** | In Progress |
+| **M4 — WGPU Acceleration & Memory Pools** | Complete |
 | M5A — Ergonomics & Polish | Planned |
 | M5B — Advanced Vision & Checkpointing | Planned |
 
@@ -55,18 +55,20 @@ all named struct fields. Safetensors serialization via `bytemuck::cast_slice`
 test: XOR MLP trains with Adam, converges in <200 epochs, save/load roundtrip
 produces exact output match.
 
-**Milestone 4** (in progress) adds GPU acceleration. Chunk 1 refactored
-`StorageInner` to `parking_lot::RwLock<StorageData>` enum (`Cpu`, `Gpu`, `Both`,
-`Transferring`) with mapped guards, `GpuContext` singleton, `BufferPool`,
-and lock-drop-transfer-reacquire device transfers. Chunk 2 delivers WGSL compute
-shaders (4 modules, 10 entry points) with all uniform structs 16-byte padded per
-WebGPU spec and compile-time `size_of` assertions. `PipelineCache` with named
-struct fields (compile-time pipeline guarantees, no HashMap). `GpuContext` now
-holds the pipeline cache and buffer pool. GPU dispatch integrated into all tensor
-ops (`add`, `sub`, `mul`, `matmul`, `relu`, `add_bias`) via `is_gpu()` check
-and shared `compute_binary`/`wrap_binary_result` helpers. Fresh uniform buffer per
-dispatch (safe against in-flight races). All WGPU code feature-gated behind
-`--features gpu`. CPU E2E test unchanged and passing.
+**Milestone 4** delivers full GPU acceleration. `StorageInner` refactored to
+`parking_lot::RwLock<StorageData>` enum (`Cpu`, `Gpu`, `Both`, `Transferring`)
+with mapped guards, `GpuContext` singleton, `BufferPool`, and
+lock-drop-transfer-reacquire device transfers. 5 WGSL shader modules (12 entry
+points) with all uniform structs 16-byte padded per WebGPU spec and compile-time
+`size_of` assertions. `PipelineCache` with named struct fields for 12 pipelines
++ 6 bind group layouts. GPU dispatch integrated into all tensor ops via
+`is_gpu()` check. Fused WGSL optimizer kernels (`adam_step`, `sgd_step`) —
+moments + weights updated in a single dispatch per parameter, zero D2H for
+weights. Backward pass stays on-device: seed gradient pushed to GPU causes the
+entire backward cascade to dispatch WGSL kernels. `Tensor::to_gpu()` and
+`ModuleToGpu` blanket trait for device transfer. E2E GPU test: XOR MLP trains
+entirely on the GPU and converges. All WGPU code feature-gated behind
+`--features gpu`.
 
 ## Architecture
 
@@ -88,7 +90,7 @@ dispatch (safe against in-flight races). All WGPU code feature-gated behind
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
 | `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool` |
-| `PipelineCache` | Named struct fields for all 10 compute pipelines + 4 bind group layouts (no HashMap) |
+| `PipelineCache` | Named struct fields for 12 compute pipelines + 6 bind group layouts (no HashMap) |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
@@ -104,8 +106,9 @@ dispatch (safe against in-flight races). All WGPU code feature-gated behind
 | `Module` trait | State-only: `parameters`, `train`/`eval`, `state_dict`/`load_state_dict` — `forward` is inherent |
 | `#[derive(Module)]` | Proc macro generating all `Module` methods by iterating struct fields |
 | `Optimizer` trait | `step(&mut self, &mut GradientStore)` — drain pattern |
-| `SGD` | Vanilla + momentum, `RwLock` write guards with block scoping |
-| `Adam` | `ParamId`-keyed moment buffers, bias correction, block-scoped locks |
+| `SGD` | CPU: block-scoped `RwLock` guards. GPU: fused `sgd_step` WGSL kernel |
+| `Adam` | CPU: block-scoped locks. GPU: fused `adam_step` WGSL kernel (m + v + param in one dispatch) |
+| `Tensor::to_gpu()` | Triggers H2D transfer; `ModuleToGpu` blanket trait pushes all params |
 | `Linear` | `[in, out]` weight layout, Kaiming init, `add_bias` for 1D bias broadcasting |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
@@ -131,6 +134,7 @@ RUMUS/
 cargo build                   # CPU-only build
 cargo build --features gpu    # with WGPU GPU backend
 cargo test                    # runs all tests (CPU)
+cargo test --features gpu     # runs CPU + GPU tests
 ```
 
 External dependencies: `syn`/`quote`/`proc-macro2` (macro crate),

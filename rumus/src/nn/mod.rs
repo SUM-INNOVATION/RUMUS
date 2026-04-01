@@ -12,6 +12,8 @@ pub use io::{load_safetensors, save_safetensors};
 pub use linear::Linear;
 pub use loss::mse_loss;
 pub use module::Module;
+#[cfg(feature = "gpu")]
+pub use module::ModuleToGpu;
 pub use parameter::Parameter;
 
 // Re-export the derive macro so users can write `use rumus::nn::Module;`

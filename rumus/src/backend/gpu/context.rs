@@ -35,6 +35,12 @@ pub struct PipelineCache {
     pub bias_layout: wgpu::BindGroupLayout,
     pub add_bias_pipeline: wgpu::ComputePipeline,
     pub sum_rows_pipeline: wgpu::ComputePipeline,
+
+    // Optimizer ops
+    pub sgd_layout: wgpu::BindGroupLayout,
+    pub sgd_pipeline: wgpu::ComputePipeline,
+    pub adam_layout: wgpu::BindGroupLayout,
+    pub adam_pipeline: wgpu::ComputePipeline,
 }
 
 impl PipelineCache {
@@ -112,6 +118,36 @@ impl PipelineCache {
             ),
         });
 
+        let optim_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("optim"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/optim.wgsl").into(),
+            ),
+        });
+
+        // SGD: grad(read) + vel(rw) + param(rw) + uniform
+        let sgd_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sgd_layout"),
+            entries: &[
+                bgl_storage(0, true),
+                bgl_storage_rw(1),
+                bgl_storage_rw(2),
+                bgl_uniform(3),
+            ],
+        });
+
+        // Adam: grad(read) + m(rw) + v(rw) + param(rw) + uniform
+        let adam_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("adam_layout"),
+            entries: &[
+                bgl_storage(0, true),
+                bgl_storage_rw(1),
+                bgl_storage_rw(2),
+                bgl_storage_rw(3),
+                bgl_uniform(4),
+            ],
+        });
+
         // ---- Pipelines ---------------------------------------------------------
 
         let make_pipeline = |layout: &wgpu::BindGroupLayout,
@@ -176,6 +212,16 @@ impl PipelineCache {
                 "sum_rows",
             ),
             bias_layout,
+
+            sgd_pipeline: make_pipeline(&sgd_layout, &optim_module, "sgd_step", "sgd"),
+            sgd_layout,
+            adam_pipeline: make_pipeline(
+                &adam_layout,
+                &optim_module,
+                "adam_step",
+                "adam",
+            ),
+            adam_layout,
         }
     }
 }

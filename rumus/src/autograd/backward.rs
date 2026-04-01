@@ -26,6 +26,13 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
 
     let mut grads = GradientStore::new();
     let seed = Tensor::new(vec![1.0f32], tensor.shape().to_vec());
+    // If the root tensor is GPU-resident, push the seed to the GPU so
+    // the entire backward pass stays on-device — all tensor ops check
+    // is_gpu() and dispatch WGSL kernels automatically.
+    #[cfg(feature = "gpu")]
+    if tensor.storage.is_gpu() {
+        seed.to_gpu();
+    }
     grads.accumulate(root_grad_id, seed)?;
 
     let mut pending: HashMap<GradId, usize> = HashMap::new();

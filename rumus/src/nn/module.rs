@@ -55,3 +55,24 @@ pub trait Module {
         prefix: &str,
     ) -> Result<(), AutogradError>;
 }
+
+/// Blanket extension trait for moving module parameters to the GPU.
+///
+/// Automatically implemented for any type that implements [`Module`].
+/// Calling `to_gpu()` pushes all parameter tensors to the GPU via H2D
+/// transfer.
+#[cfg(feature = "gpu")]
+pub trait ModuleToGpu: Module {
+    /// Push all parameters to the GPU.
+    ///
+    /// Triggers H2D transfers for any CPU-only parameters.
+    /// No-op for parameters already on the GPU.
+    fn to_gpu(&self) {
+        for param in self.parameters() {
+            param.tensor.to_gpu();
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl<T: Module> ModuleToGpu for T {}

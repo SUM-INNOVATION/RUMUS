@@ -217,6 +217,20 @@ impl StorageHandle {
         )
     }
 
+    /// Mark the GPU copy as having the latest data (CPU copy is stale).
+    ///
+    /// Called after a GPU compute kernel writes to the buffer (e.g.,
+    /// optimizer step).  The `wgpu::Buffer` handle is written to by the
+    /// GPU asynchronously — this method records that the CPU side needs
+    /// a D2H transfer before it can be read.
+    #[cfg(feature = "gpu")]
+    pub fn mark_gpu_dirty(&self) {
+        let mut guard = self.inner.data.write();
+        if let StorageData::Both { dirty, .. } = &mut *guard {
+            *dirty = DirtySide::Gpu;
+        }
+    }
+
     /// Read the current version counter (`Acquire` ordering).
     pub fn version(&self) -> usize {
         self.inner.version.load(Ordering::Acquire)
@@ -412,7 +426,7 @@ impl StorageHandle {
     /// Same as [`ensure_cpu`] — write lock held only for state swap, not
     /// during the blocking upload.
     #[cfg(feature = "gpu")]
-    fn ensure_gpu(&self) {
+    pub fn ensure_gpu(&self) {
         {
             let guard = self.inner.data.read();
             match &*guard {
@@ -731,5 +745,14 @@ impl Tensor {
         layout: Layout,
     ) -> Tensor {
         Tensor { storage, layout, state: AutogradState::None }
+    }
+
+    /// Ensure this tensor's data is on the GPU.
+    ///
+    /// Triggers an H2D transfer if currently CPU-only.  No-op if the
+    /// data is already GPU-resident.
+    #[cfg(feature = "gpu")]
+    pub fn to_gpu(&self) {
+        self.storage.ensure_gpu();
     }
 }

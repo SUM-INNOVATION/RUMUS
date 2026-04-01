@@ -1,4 +1,7 @@
 //! Stochastic Gradient Descent with optional momentum.
+//!
+//! When parameters are GPU-resident, dispatches a WGSL kernel —
+//! zero D2H transfers.
 
 use std::collections::HashMap;
 
@@ -7,32 +10,14 @@ use crate::nn::Parameter;
 use crate::optim::Optimizer;
 use crate::tensor::{ParamId, Tensor};
 
-/// SGD optimizer with optional momentum.
-///
-/// When `momentum > 0`, maintains a velocity buffer per parameter:
-///
-/// ```text
-/// v_t = momentum * v_{t-1} + grad
-/// param -= lr * v_t
-/// ```
-///
-/// Velocity tensors are created with `AutogradState::None` — optimizer
-/// state is never tracked by the autograd engine.
 pub struct SGD {
     params: Vec<Parameter>,
     lr: f32,
     momentum: f32,
-    /// Momentum buffers, keyed by [`ParamId`].  Lazily initialized on
-    /// the first step.
     velocity: HashMap<ParamId, Tensor>,
 }
 
 impl SGD {
-    /// Create a new SGD optimizer.
-    ///
-    /// - `params`: cloned from a module's `parameters()`.
-    /// - `lr`: learning rate.
-    /// - `momentum`: momentum factor (0.0 for vanilla SGD).
     pub fn new(params: Vec<Parameter>, lr: f32, momentum: f32) -> Self {
         Self {
             params,
@@ -51,19 +36,58 @@ impl Optimizer for SGD {
                 .ok_or(AutogradError::MissingGrad {
                     grad_id: param.grad_id(),
                 })?;
-            let grad_guard = grad.storage.data();
             let numel = param.tensor.numel();
 
-            if self.momentum > 0.0 {
-                let shape = param.tensor.shape().to_vec();
-                let vel = self
-                    .velocity
-                    .entry(param.id)
-                    .or_insert_with(|| Tensor::new(vec![0.0; numel], shape));
+            // Ensure velocity buffer exists (needed for both GPU and CPU
+            // when momentum > 0; also used as dummy for GPU path when
+            // momentum == 0).
+            let shape = param.tensor.shape().to_vec();
+            let vel = self
+                .velocity
+                .entry(param.id)
+                .or_insert_with(|| Tensor::new(vec![0.0; numel], shape));
 
-                // Write locks on velocity and param — separate Arc allocations,
-                // no deadlock possible.  Block scope makes lock lifetimes
-                // visually explicit.
+            // ---- GPU path ----
+            #[cfg(feature = "gpu")]
+            if param.tensor.storage.is_gpu() {
+                use crate::backend::gpu::{
+                    compute as gpu_compute,
+                    context::GpuContext,
+                };
+
+                let ctx = GpuContext::get().expect("GPU required for GPU param");
+
+                grad.to_gpu();
+                vel.to_gpu();
+
+                let grad_buf = grad.storage.gpu_buffer();
+                let vel_buf = vel.storage.gpu_buffer();
+                let param_buf = param.tensor.storage.gpu_buffer();
+
+                gpu_compute::sgd_step(
+                    ctx,
+                    &grad_buf,
+                    &vel_buf,
+                    &param_buf,
+                    numel as u32,
+                    self.lr,
+                    self.momentum,
+                );
+
+                drop(grad_buf);
+                drop(vel_buf);
+                drop(param_buf);
+
+                vel.storage.mark_gpu_dirty();
+                param.tensor.storage.mark_gpu_dirty();
+                param.tensor.storage.bump_version();
+                continue;
+            }
+
+            // ---- CPU path ----
+            let grad_guard = grad.storage.data();
+
+            if self.momentum > 0.0 {
                 {
                     let mut vel_data = vel.storage.data_write();
                     let mut param_data = param.tensor.storage.data_write();
@@ -81,8 +105,6 @@ impl Optimizer for SGD {
                     }
                 }
             }
-            // All write guards dropped by block scope; grad read guard
-            // dropped explicitly before version bump.
             drop(grad_guard);
             param.tensor.storage.bump_version();
         }
