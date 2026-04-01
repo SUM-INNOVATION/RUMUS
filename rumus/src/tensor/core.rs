@@ -190,9 +190,31 @@ impl StorageHandle {
         }
     }
 
+    /// Create new GPU-resident storage wrapping a `wgpu::Buffer`.
+    #[cfg(feature = "gpu")]
+    pub fn new_gpu(buffer: wgpu::Buffer, len: usize) -> Self {
+        Self {
+            inner: Arc::new(StorageInner {
+                data: RwLock::new(StorageData::Gpu { buffer, len }),
+                len,
+                version: AtomicUsize::new(0),
+                fence: AtomicUsize::new(NO_FENCE),
+            }),
+        }
+    }
+
     /// Number of f32 elements in this storage.
     pub fn len(&self) -> usize {
         self.inner.len
+    }
+
+    /// Returns `true` if the data is (at least partially) on the GPU.
+    #[cfg(feature = "gpu")]
+    pub fn is_gpu(&self) -> bool {
+        matches!(
+            &*self.inner.data.read(),
+            StorageData::Gpu { .. } | StorageData::Both { .. }
+        )
     }
 
     /// Read the current version counter (`Acquire` ordering).

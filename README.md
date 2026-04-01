@@ -55,17 +55,18 @@ all named struct fields. Safetensors serialization via `bytemuck::cast_slice`
 test: XOR MLP trains with Adam, converges in <200 epochs, save/load roundtrip
 produces exact output match.
 
-**Milestone 4** (in progress) adds GPU acceleration foundations. `StorageInner`
-refactored from `std::sync::RwLock<Vec<f32>>` to `parking_lot::RwLock<StorageData>`
-where `StorageData` is an enum (`Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`,
-`Both { cpu, gpu, dirty: DirtySide }`, `Transferring`).  `data()` / `data_write()`
-use `parking_lot::RwLockReadGuard::map` / `RwLockWriteGuard::map` to return
-mapped guards projecting into the CPU vec slice. `GpuContext` singleton via
-`OnceLock<Option<...>>` (never panics on missing hardware). `BufferPool` with
-power-of-2 size bucketing for GPU buffer reuse. Lazy `ensure_cpu` / `ensure_gpu`
-transfers with lock-drop-transfer-reacquire pattern (`Transferring` sentinel
-prevents stalling unrelated readers during blocking GPU IO). All WGPU code is
-feature-gated behind `--features gpu`. WGSL compute shaders next.
+**Milestone 4** (in progress) adds GPU acceleration. Chunk 1 refactored
+`StorageInner` to `parking_lot::RwLock<StorageData>` enum (`Cpu`, `Gpu`, `Both`,
+`Transferring`) with mapped guards, `GpuContext` singleton, `BufferPool`,
+and lock-drop-transfer-reacquire device transfers. Chunk 2 delivers WGSL compute
+shaders (4 modules, 10 entry points) with all uniform structs 16-byte padded per
+WebGPU spec and compile-time `size_of` assertions. `PipelineCache` with named
+struct fields (compile-time pipeline guarantees, no HashMap). `GpuContext` now
+holds the pipeline cache and buffer pool. GPU dispatch integrated into all tensor
+ops (`add`, `sub`, `mul`, `matmul`, `relu`, `add_bias`) via `is_gpu()` check
+and shared `compute_binary`/`wrap_binary_result` helpers. Fresh uniform buffer per
+dispatch (safe against in-flight races). All WGPU code feature-gated behind
+`--features gpu`. CPU E2E test unchanged and passing.
 
 ## Architecture
 
@@ -86,7 +87,8 @@ feature-gated behind `--features gpu`. WGSL compute shaders next.
 |--------|------|
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
-| `GpuContext` | `OnceLock<Option<...>>` singleton holding `wgpu::Device` + `Queue` |
+| `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool` |
+| `PipelineCache` | Named struct fields for all 10 compute pipelines + 4 bind group layouts (no HashMap) |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
