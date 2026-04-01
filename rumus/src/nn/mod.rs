@@ -1,6 +1,7 @@
 //! Neural network building blocks: parameters, modules, layers, losses, and IO.
 
 mod activations;
+mod conv;
 mod io;
 mod linear;
 mod loss;
@@ -8,6 +9,7 @@ mod module;
 mod parameter;
 
 pub use activations::relu;
+pub use conv::Conv2d;
 pub use io::{load_safetensors, save_safetensors};
 pub use linear::Linear;
 pub use loss::mse_loss;

@@ -143,6 +143,60 @@ pub struct AddBiasBackward {
     pub n: usize,
 }
 
+/// Backward for `slice_batch(input, index)`.
+///
+/// `∂L/∂input` is a zero tensor matching the original batched input shape,
+/// with `∂L/∂output` placed at the `index`-th batch slot.
+#[derive(Debug)]
+pub struct SliceBatchBackward {
+    pub input_version: VersionSnapshot,
+    /// Shape of the original batched input (e.g. `[batch, C, H, W]`).
+    pub original_shape: Vec<usize>,
+    /// Which batch element was sliced.
+    pub index: usize,
+}
+
+/// Backward for `im2col(input)`.
+///
+/// `∂L/∂input = col2im(∂L/∂output)`.
+#[derive(Debug)]
+pub struct Im2ColBackward {
+    pub input_version: VersionSnapshot,
+    pub c_in: usize,
+    pub h: usize,
+    pub w: usize,
+    pub kernel_size: usize,
+    pub stride: usize,
+    pub padding: usize,
+    pub out_h: usize,
+    pub out_w: usize,
+}
+
+/// Backward for `stack([t0, t1, ...], axis=0)`.
+///
+/// `∂L/∂t_i = slice(∂L/∂output, i)` along axis 0.
+#[derive(Debug)]
+pub struct StackBackward {
+    /// Number of tensors that were stacked.
+    pub count: usize,
+    /// Shape of each individual tensor (all must match).
+    pub each_shape: Vec<usize>,
+    /// Version snapshots for each input.
+    pub versions: Vec<VersionSnapshot>,
+}
+
+/// Backward for `add_channel_bias(src, bias)`.
+///
+/// `∂L/∂src = ∂L/∂out`  (identity, same shape `[batch*C, spatial]`)
+/// `∂L/∂bias = sum over spatial of ∂L/∂out` per channel.
+#[derive(Debug)]
+pub struct AddChannelBiasBackward {
+    pub input_version: VersionSnapshot,
+    pub bias_version: VersionSnapshot,
+    pub channels: usize,
+    pub spatial: usize,
+}
+
 // ---------------------------------------------------------------------------
 // BackwardOp enum
 // ---------------------------------------------------------------------------
@@ -159,6 +213,10 @@ pub enum BackwardOp {
     Relu(ReluBackward),
     MseLoss(MseLossBackward),
     AddBias(AddBiasBackward),
+    Im2Col(Im2ColBackward),
+    Stack(StackBackward),
+    AddChannelBias(AddChannelBiasBackward),
+    SliceBatch(SliceBatchBackward),
 }
 
 const _: () = {

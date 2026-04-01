@@ -87,4 +87,82 @@ impl Backend for CpuBackend {
             }
         }
     }
+
+    fn im2col(
+        src: &[f32], dst: &mut [f32],
+        c_in: usize, h: usize, w: usize,
+        k: usize, stride: usize, pad: usize,
+        out_h: usize, out_w: usize,
+    ) {
+        let num_patches = out_h * out_w;
+        for c in 0..c_in {
+            for kh in 0..k {
+                for kw in 0..k {
+                    let row = c * k * k + kh * k + kw;
+                    for oh in 0..out_h {
+                        for ow in 0..out_w {
+                            let col = oh * out_w + ow;
+                            let ih = (oh * stride + kh) as isize - pad as isize;
+                            let iw = (ow * stride + kw) as isize - pad as isize;
+                            dst[row * num_patches + col] =
+                                if ih >= 0 && ih < h as isize && iw >= 0 && iw < w as isize {
+                                    src[c * h * w + ih as usize * w + iw as usize]
+                                } else {
+                                    0.0
+                                };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn col2im(
+        src: &[f32], dst: &mut [f32],
+        c_in: usize, h: usize, w: usize,
+        k: usize, stride: usize, pad: usize,
+        out_h: usize, out_w: usize,
+    ) {
+        let num_patches = out_h * out_w;
+        for c in 0..c_in {
+            for kh in 0..k {
+                for kw in 0..k {
+                    let row = c * k * k + kh * k + kw;
+                    for oh in 0..out_h {
+                        for ow in 0..out_w {
+                            let col = oh * out_w + ow;
+                            let ih = (oh * stride + kh) as isize - pad as isize;
+                            let iw = (ow * stride + kw) as isize - pad as isize;
+                            if ih >= 0 && ih < h as isize && iw >= 0 && iw < w as isize {
+                                dst[c * h * w + ih as usize * w + iw as usize]
+                                    += src[row * num_patches + col];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_channel_bias(
+        src: &[f32], bias: &[f32], dst: &mut [f32],
+        channels: usize, spatial: usize,
+    ) {
+        for c in 0..channels {
+            for s in 0..spatial {
+                dst[c * spatial + s] = src[c * spatial + s] + bias[c];
+            }
+        }
+    }
+
+    fn sum_channel_bias_grad(
+        src: &[f32], dst: &mut [f32],
+        channels: usize, spatial: usize,
+    ) {
+        for c in 0..channels {
+            for s in 0..spatial {
+                dst[c] += src[c * spatial + s];
+            }
+        }
+    }
 }

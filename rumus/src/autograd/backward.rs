@@ -173,15 +173,82 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 bw.input_version.check()?;
                 bw.bias_version.check()?;
                 let (m, n) = (bw.m, bw.n);
-                // ∂L/∂matrix = ∂L/∂y (identity, same shape [m,n])
                 grads.accumulate(entry.inputs[0], out_grad.clone())?;
-                // ∂L/∂bias = sum_rows(∂L/∂y), shape [n]
                 let og_c = out_grad.contiguous();
                 let og_guard = og_c.storage.data();
                 let mut bias_grad = CpuBackend::zeros(n);
                 CpuBackend::sum_rows(&og_guard, &mut bias_grad, m, n);
                 drop(og_guard);
                 let grad_bias = Tensor::new(bias_grad, vec![n]);
+                grads.accumulate(entry.inputs[1], grad_bias)?;
+            }
+
+            BackwardOp::Im2Col(bw) => {
+                bw.input_version.check()?;
+                // ∂L/∂input = col2im(∂L/∂output)
+                let og_c = out_grad.contiguous();
+                let og_guard = og_c.storage.data();
+                let input_numel = bw.c_in * bw.h * bw.w;
+                let mut dst = CpuBackend::zeros(input_numel);
+                CpuBackend::col2im(
+                    &og_guard, &mut dst,
+                    bw.c_in, bw.h, bw.w,
+                    bw.kernel_size, bw.stride, bw.padding,
+                    bw.out_h, bw.out_w,
+                );
+                drop(og_guard);
+                let grad_input = Tensor::new(dst, vec![bw.c_in, bw.h, bw.w]);
+                grads.accumulate(entry.inputs[0], grad_input)?;
+            }
+
+            BackwardOp::Stack(bw) => {
+                for v in &bw.versions {
+                    v.check()?;
+                }
+                // ∂L/∂t_i = slice out_grad along axis 0 at index i
+                let each_numel: usize = bw.each_shape.iter().product();
+                let og_c = out_grad.contiguous();
+                let og_guard = og_c.storage.data();
+                for i in 0..bw.count {
+                    let start = i * each_numel;
+                    let slice_data = og_guard[start..start + each_numel].to_vec();
+                    let grad_i = Tensor::new(slice_data, bw.each_shape.clone());
+                    grads.accumulate(entry.inputs[i], grad_i)?;
+                }
+                drop(og_guard);
+            }
+
+            BackwardOp::SliceBatch(bw) => {
+                bw.input_version.check()?;
+                // ∂L/∂input is a zero tensor with out_grad placed at batch index.
+                let total_numel: usize = bw.original_shape.iter().product();
+                let batch_size = bw.original_shape[0];
+                let element_numel = total_numel / batch_size;
+                let mut dst = vec![0.0f32; total_numel];
+                let og_c = out_grad.contiguous();
+                let og_guard = og_c.storage.data();
+                let start = bw.index * element_numel;
+                dst[start..start + element_numel].copy_from_slice(&og_guard);
+                drop(og_guard);
+                let grad_input = Tensor::new(dst, bw.original_shape.clone());
+                grads.accumulate(entry.inputs[0], grad_input)?;
+            }
+
+            BackwardOp::AddChannelBias(bw) => {
+                bw.input_version.check()?;
+                bw.bias_version.check()?;
+                // ∂L/∂src = ∂L/∂out (identity)
+                grads.accumulate(entry.inputs[0], out_grad.clone())?;
+                // ∂L/∂bias = sum over spatial per channel
+                let og_c = out_grad.contiguous();
+                let og_guard = og_c.storage.data();
+                let mut bias_grad = CpuBackend::zeros(bw.channels);
+                CpuBackend::sum_channel_bias_grad(
+                    &og_guard, &mut bias_grad,
+                    bw.channels, bw.spatial,
+                );
+                drop(og_guard);
+                let grad_bias = Tensor::new(bias_grad, vec![bw.channels]);
                 grads.accumulate(entry.inputs[1], grad_bias)?;
             }
         }

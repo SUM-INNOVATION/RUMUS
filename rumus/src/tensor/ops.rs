@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, AddBiasBackward, BackwardOp, MatmulBackward, MseLossBackward, MulBackward,
-    ReluBackward, SubBackward, TapeEntry, VersionSnapshot,
+    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, Im2ColBackward,
+    MatmulBackward, MseLossBackward, MulBackward, ReluBackward, StackBackward, SubBackward,
+    TapeEntry, VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
 #[cfg(feature = "gpu")]
@@ -524,5 +525,303 @@ impl Tensor {
             m, n,
         });
         wrap_binary_result(out_storage, result_shape, self, bias, mat_gid, bias_gid, op)
+    }
+
+    /// Extract a single batch element from a batched tensor.
+    ///
+    /// Input shape: `[batch, ...]`.
+    /// Output shape: `[...]` (the leading batch dimension is removed).
+    ///
+    /// This is a tracked op — `SliceBatchBackward` scatters the gradient
+    /// back into the correct batch slot of a zeroed full-batch gradient.
+    ///
+    /// Note: this materializes a copied tensor (not zero-copy).  The tape
+    /// remains connected — gradients flow correctly.  A zero-copy view-based
+    /// slice is a future optimization.
+    pub fn slice_batch(&self, index: usize) -> Tensor {
+        assert!(self.ndim() >= 2, "slice_batch: need at least 2 dims");
+        let batch = self.shape()[0];
+        assert!(index < batch, "slice_batch: index {} >= batch {}", index, batch);
+
+        let element_shape: Vec<usize> = self.shape()[1..].to_vec();
+        let element_numel: usize = element_shape.iter().product();
+
+        let input_c = self.contiguous();
+        let guard = input_c.storage.data();
+        let start = index * element_numel;
+        let slice_data = guard[start..start + element_numel].to_vec();
+        drop(guard);
+
+        let out_storage = StorageHandle::new(slice_data);
+
+        if self.requires_grad() && !context::is_no_grad() {
+            use crate::autograd::SliceBatchBackward;
+
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::SliceBatch(SliceBatchBackward {
+                        input_version,
+                        original_shape: self.shape().to_vec(),
+                        index,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(element_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true,
+                    grad_id: Some(out_grad_id),
+                    creator: op_id,
+                    is_leaf: false,
+                    retains_grad: false,
+                    total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(element_shape),
+                state: AutogradState::None,
+            }
+        }
+    }
+
+    /// im2col: extract sliding-window patches for convolution.
+    ///
+    /// Input shape: `[C_in, H, W]` (single sample, no batch dim).
+    /// Output shape: `[C_in * K * K, out_h * out_w]`.
+    ///
+    /// This is a tracked op — `Im2ColBackward` calls `col2im`.
+    pub fn im2col(
+        &self,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Tensor {
+        assert_eq!(self.ndim(), 3, "im2col: input must be 3-D [C, H, W]");
+        let c_in = self.shape()[0];
+        let h = self.shape()[1];
+        let w = self.shape()[2];
+        let out_h = (h + 2 * padding - kernel_size) / stride + 1;
+        let out_w = (w + 2 * padding - kernel_size) / stride + 1;
+        let col_height = c_in * kernel_size * kernel_size;
+        let num_patches = out_h * out_w;
+
+        let input_c = self.contiguous();
+        let in_guard = input_c.storage.data();
+        let mut dst = CpuBackend::zeros(col_height * num_patches);
+        CpuBackend::im2col(
+            &in_guard, &mut dst,
+            c_in, h, w, kernel_size, stride, padding, out_h, out_w,
+        );
+        drop(in_guard);
+
+        let out_storage = StorageHandle::new(dst);
+        let result_shape = vec![col_height, num_patches];
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Im2Col(Im2ColBackward {
+                        input_version,
+                        c_in, h, w,
+                        kernel_size, stride, padding,
+                        out_h, out_w,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true,
+                    grad_id: Some(out_grad_id),
+                    creator: op_id,
+                    is_leaf: false,
+                    retains_grad: false,
+                    total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::None,
+            }
+        }
+    }
+
+    /// Add channel-wise bias: `out[c*spatial+s] = self[c*spatial+s] + bias[c]`.
+    ///
+    /// `self` shape: `[channels, spatial]` (or `[batch*channels, spatial]`).
+    /// `bias` shape: `[channels]`.
+    pub fn add_channel_bias(&self, bias: &Tensor) -> Tensor {
+        assert_eq!(self.ndim(), 2, "add_channel_bias: input must be 2-D [C, spatial]");
+        assert_eq!(bias.ndim(), 1, "add_channel_bias: bias must be 1-D [C]");
+        let channels = self.shape()[0];
+        let spatial = self.shape()[1];
+        assert_eq!(bias.shape()[0], channels, "add_channel_bias: channel mismatch");
+
+        let src_c = self.contiguous();
+        let bias_c = bias.contiguous();
+        let sg = src_c.storage.data();
+        let bg = bias_c.storage.data();
+        let mut dst = CpuBackend::zeros(channels * spatial);
+        CpuBackend::add_channel_bias(&sg, &bg, &mut dst, channels, spatial);
+        drop(bg);
+        drop(sg);
+
+        let out_storage = StorageHandle::new(dst);
+        let result_shape = vec![channels, spatial];
+
+        if should_record(self, bias) {
+            let out_grad_id = context::next_grad_id();
+            let src_gid = require_grad_id(self).unwrap_or_else(context::next_grad_id);
+            let bias_gid = require_grad_id(bias).unwrap_or_else(context::next_grad_id);
+
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(meta) = bias.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+
+            let input_version = VersionSnapshot::new(src_gid, &self.storage);
+            let bias_version = VersionSnapshot::new(bias_gid, &bias.storage);
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::AddChannelBias(AddChannelBiasBackward {
+                        input_version,
+                        bias_version,
+                        channels,
+                        spatial,
+                    }),
+                    inputs: vec![src_gid, bias_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true,
+                    grad_id: Some(out_grad_id),
+                    creator: op_id,
+                    is_leaf: false,
+                    retains_grad: false,
+                    total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::None,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free-standing tracked ops
+// ---------------------------------------------------------------------------
+
+/// Stack tensors along axis 0: `[shape] * count → [count, ...shape]`.
+///
+/// All tensors must have the same shape.  This is a tracked op —
+/// `StackBackward` splits the gradient back into individual tensors.
+pub fn stack(tensors: &[Tensor]) -> Tensor {
+    assert!(!tensors.is_empty(), "stack: empty input");
+    let each_shape = tensors[0].shape().to_vec();
+    let each_numel: usize = each_shape.iter().product();
+    for t in tensors {
+        assert_eq!(t.shape(), &each_shape[..], "stack: shape mismatch");
+    }
+
+    let count = tensors.len();
+    let mut data = Vec::with_capacity(count * each_numel);
+    for t in tensors {
+        let tc = t.contiguous();
+        let g = tc.storage.data();
+        data.extend_from_slice(&g);
+    }
+
+    let mut result_shape = vec![count];
+    result_shape.extend_from_slice(&each_shape);
+
+    let out_storage = StorageHandle::new(data);
+
+    let any_tracked = tensors.iter().any(|t| t.requires_grad())
+        && !context::is_no_grad();
+
+    if any_tracked {
+        let out_grad_id = context::next_grad_id();
+
+        let mut input_gids = Vec::with_capacity(count);
+        let mut versions = Vec::with_capacity(count);
+        for t in tensors {
+            let gid = require_grad_id(t).unwrap_or_else(context::next_grad_id);
+            versions.push(VersionSnapshot::new(gid, &t.storage));
+            if let Some(meta) = t.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+            input_gids.push(gid);
+        }
+
+        let op_id = context::with_tape(|tape| {
+            tape.push(TapeEntry {
+                op: BackwardOp::Stack(StackBackward {
+                    count,
+                    each_shape: each_shape.clone(),
+                    versions,
+                }),
+                inputs: input_gids,
+                outputs: vec![out_grad_id],
+            })
+        });
+
+        Tensor {
+            storage: out_storage,
+            layout: Layout::contiguous(result_shape),
+            state: AutogradState::Tracked(Arc::new(TensorMeta {
+                requires_grad: true,
+                grad_id: Some(out_grad_id),
+                creator: op_id,
+                is_leaf: false,
+                retains_grad: false,
+                total_grads: AtomicUsize::new(0),
+            })),
+        }
+    } else {
+        Tensor {
+            storage: out_storage,
+            layout: Layout::contiguous(result_shape),
+            state: AutogradState::None,
+        }
     }
 }

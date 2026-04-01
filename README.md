@@ -20,8 +20,9 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M2 — Autograd Engine** | Complete |
 | **M3 — Core API, Optimizers & MVP Macros** | Complete |
 | **M4 — WGPU Acceleration & Memory Pools** | Complete |
-| M5A — Ergonomics & Polish | Planned |
-| M5B — Advanced Vision & Checkpointing | Planned |
+| **M5 — Conv2D & Advanced Layers** | Complete |
+| M6A — Ergonomics & Polish | Planned |
+| M6B — Checkpointing & Memory Efficiency | Planned |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -70,6 +71,16 @@ entire backward cascade to dispatch WGSL kernels. `Tensor::to_gpu()` and
 entirely on the GPU and converges. All WGPU code feature-gated behind
 `--features gpu`.
 
+**Milestone 5** delivers Conv2D via the im2col algorithm. `im2col`, `col2im`,
+`slice_batch`, `stack`, `add_channel_bias` — all fully tracked tensor ops with
+dedicated backward implementations. `Conv2d` module forward is a pure
+mathematical script calling tracked ops (`slice_batch → im2col → matmul →
+add_channel_bias → stack → reshape`); the autograd engine handles the entire
+backward pass automatically via Kahn's traversal. `SliceBatchBackward` scatters
+gradients back to the correct batch slot, maintaining tape connectivity. WGSL
+kernels for im2col, col2im, and channel-bias ops. `BackwardOp` enum now has 11
+variants. Weight shape `[C_out, C_in*K*K]` for direct matmul with im2col columns.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -90,7 +101,7 @@ entirely on the GPU and converges. All WGPU code feature-gated behind
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
 | `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool` |
-| `PipelineCache` | Named struct fields for 12 compute pipelines + 6 bind group layouts (no HashMap) |
+| `PipelineCache` | Named struct fields for 16 compute pipelines + 6 bind group layouts (no HashMap) |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
@@ -101,7 +112,7 @@ entirely on the GPU and converges. All WGPU code feature-gated behind
 | `Backend` trait | Stateless associated fns (no `&self`) — `CpuBackend` is zero-sized |
 | `Tape` | Append-only Wengert list of `TapeEntry` nodes |
 | `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked |
-| `BackwardOp` | Concrete enum (7 variants: `Add`, `Sub`, `Mul`, `Matmul`, `Relu`, `MseLoss`, `AddBias`) — no closures, `Send + Sync` |
+| `BackwardOp` | Concrete enum (11 variants) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
 | `Module` trait | State-only: `parameters`, `train`/`eval`, `state_dict`/`load_state_dict` — `forward` is inherent |
 | `#[derive(Module)]` | Proc macro generating all `Module` methods by iterating struct fields |
@@ -110,6 +121,7 @@ entirely on the GPU and converges. All WGPU code feature-gated behind
 | `Adam` | CPU: block-scoped locks. GPU: fused `adam_step` WGSL kernel (m + v + param in one dispatch) |
 | `Tensor::to_gpu()` | Triggers H2D transfer; `ModuleToGpu` blanket trait pushes all params |
 | `Linear` | `[in, out]` weight layout, Kaiming init, `add_bias` for 1D bias broadcasting |
+| `Conv2d` | im2col + matmul forward, `[C_out, C_in*K*K]` weight, Kaiming init, per-batch tracked loop |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine

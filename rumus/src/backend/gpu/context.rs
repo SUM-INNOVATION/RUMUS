@@ -41,6 +41,12 @@ pub struct PipelineCache {
     pub sgd_pipeline: wgpu::ComputePipeline,
     pub adam_layout: wgpu::BindGroupLayout,
     pub adam_pipeline: wgpu::ComputePipeline,
+
+    // Conv ops (im2col, col2im share unary_layout; channel bias uses bias_layout)
+    pub im2col_pipeline: wgpu::ComputePipeline,
+    pub col2im_pipeline: wgpu::ComputePipeline,
+    pub add_channel_bias_pipeline: wgpu::ComputePipeline,
+    pub sum_channel_bias_grad_pipeline: wgpu::ComputePipeline,
 }
 
 impl PipelineCache {
@@ -125,6 +131,13 @@ impl PipelineCache {
             ),
         });
 
+        let conv_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("conv"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/conv.wgsl").into(),
+            ),
+        });
+
         // SGD: grad(read) + vel(rw) + param(rw) + uniform
         let sgd_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sgd_layout"),
@@ -170,58 +183,36 @@ impl PipelineCache {
             })
         };
 
+        // Build all pipelines before moving layouts into Self.
+        let add_pipeline = make_pipeline(&binary_layout, &ew_module, "add_kernel", "add");
+        let sub_pipeline = make_pipeline(&binary_layout, &ew_module, "sub_kernel", "sub");
+        let mul_pipeline = make_pipeline(&binary_layout, &ew_module, "mul_kernel", "mul");
+        let relu_bw_pipeline = make_pipeline(&binary_layout, &ew_module, "relu_backward_kernel", "relu_bw");
+
+        let relu_pipeline = make_pipeline(&unary_layout, &unary_module, "relu_kernel", "relu");
+        let scale_pipeline = make_pipeline(&unary_layout, &unary_module, "scale_kernel", "scale");
+        let im2col_pipeline = make_pipeline(&unary_layout, &conv_module, "im2col_kernel", "im2col");
+        let col2im_pipeline = make_pipeline(&unary_layout, &conv_module, "col2im_kernel", "col2im");
+
+        let matmul_pipeline = make_pipeline(&matmul_layout, &mm_module, "matmul_kernel", "matmul");
+
+        let add_bias_pipeline = make_pipeline(&bias_layout, &bias_module, "add_bias_kernel", "add_bias");
+        let sum_rows_pipeline = make_pipeline(&bias_layout, &bias_module, "sum_rows_kernel", "sum_rows");
+        let add_channel_bias_pipeline = make_pipeline(&bias_layout, &conv_module, "add_channel_bias_kernel", "add_ch_bias");
+        let sum_channel_bias_grad_pipeline = make_pipeline(&bias_layout, &conv_module, "sum_channel_bias_grad_kernel", "sum_ch_bias");
+
+        let sgd_pipeline = make_pipeline(&sgd_layout, &optim_module, "sgd_step", "sgd");
+        let adam_pipeline = make_pipeline(&adam_layout, &optim_module, "adam_step", "adam");
+
         Self {
-            add_pipeline: make_pipeline(&binary_layout, &ew_module, "add_kernel", "add"),
-            sub_pipeline: make_pipeline(&binary_layout, &ew_module, "sub_kernel", "sub"),
-            mul_pipeline: make_pipeline(&binary_layout, &ew_module, "mul_kernel", "mul"),
-            relu_bw_pipeline: make_pipeline(
-                &binary_layout,
-                &ew_module,
-                "relu_backward_kernel",
-                "relu_bw",
-            ),
-            binary_layout,
-
-            relu_pipeline: make_pipeline(&unary_layout, &unary_module, "relu_kernel", "relu"),
-            scale_pipeline: make_pipeline(
-                &unary_layout,
-                &unary_module,
-                "scale_kernel",
-                "scale",
-            ),
-            unary_layout,
-
-            matmul_pipeline: make_pipeline(
-                &matmul_layout,
-                &mm_module,
-                "matmul_kernel",
-                "matmul",
-            ),
-            matmul_layout,
-
-            add_bias_pipeline: make_pipeline(
-                &bias_layout,
-                &bias_module,
-                "add_bias_kernel",
-                "add_bias",
-            ),
-            sum_rows_pipeline: make_pipeline(
-                &bias_layout,
-                &bias_module,
-                "sum_rows_kernel",
-                "sum_rows",
-            ),
-            bias_layout,
-
-            sgd_pipeline: make_pipeline(&sgd_layout, &optim_module, "sgd_step", "sgd"),
-            sgd_layout,
-            adam_pipeline: make_pipeline(
-                &adam_layout,
-                &optim_module,
-                "adam_step",
-                "adam",
-            ),
-            adam_layout,
+            binary_layout, add_pipeline, sub_pipeline, mul_pipeline, relu_bw_pipeline,
+            unary_layout, relu_pipeline, scale_pipeline,
+            matmul_layout, matmul_pipeline,
+            bias_layout, add_bias_pipeline, sum_rows_pipeline,
+            sgd_layout, sgd_pipeline,
+            adam_layout, adam_pipeline,
+            im2col_pipeline, col2im_pipeline,
+            add_channel_bias_pipeline, sum_channel_bias_grad_pipeline,
         }
     }
 }

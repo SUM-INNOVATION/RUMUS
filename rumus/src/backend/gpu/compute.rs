@@ -62,13 +62,36 @@ struct AdamParams {
     _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Im2ColParams {
+    c_in: u32,
+    h: u32,
+    w: u32,
+    k: u32,
+    stride: u32,
+    pad: u32,
+    out_h: u32,
+    out_w: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ChannelBiasParams {
+    channels: u32,
+    spatial: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
 // WebGPU requires uniform buffer bindings to be a multiple of 16 bytes.
 const _: () = assert!(std::mem::size_of::<ElementwiseParams>() == 16);
 const _: () = assert!(std::mem::size_of::<MatmulParams>() == 16);
 const _: () = assert!(std::mem::size_of::<BiasParams>() == 16);
 const _: () = assert!(std::mem::size_of::<SgdParams>() == 16);
 const _: () = assert!(std::mem::size_of::<AdamParams>() == 32);
-// 32 is a multiple of 16 ✓
+const _: () = assert!(std::mem::size_of::<Im2ColParams>() == 32);
+const _: () = assert!(std::mem::size_of::<ChannelBiasParams>() == 16);
 
 // ---------------------------------------------------------------------------
 // Binary element-wise ops (add, sub, mul, relu_backward)
@@ -390,6 +413,122 @@ pub fn adam_step(
         pass.set_pipeline(&ctx.pipelines.adam_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups((numel + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Conv ops (im2col, col2im, channel bias)
+// ---------------------------------------------------------------------------
+
+/// im2col dispatch: [C_in, H, W] → [col_height, num_patches].
+pub fn im2col_dispatch(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    c_in: u32, h: u32, w: u32,
+    k: u32, stride: u32, pad: u32,
+    out_h: u32, out_w: u32,
+) {
+    let params = Im2ColParams { c_in, h, w, k, stride, pad, out_h, out_w };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("im2col_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let total = c_in * k * k * out_h * out_w;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.im2col_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// col2im dispatch: [col_height, num_patches] → [C_in, H, W].
+pub fn col2im_dispatch(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    c_in: u32, h: u32, w: u32,
+    k: u32, stride: u32, pad: u32,
+    out_h: u32, out_w: u32,
+) {
+    let params = Im2ColParams { c_in, h, w, k, stride, pad, out_h, out_w };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("col2im_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let total = c_in * h * w;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.col2im_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// add_channel_bias: [C, spatial] + [C] → [C, spatial].
+pub fn add_channel_bias(
+    ctx: &GpuContext,
+    src: &wgpu::Buffer,
+    bias: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    channels: u32,
+    spatial: u32,
+) {
+    let params = ChannelBiasParams { channels, spatial, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("channel_bias_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.bias_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: src.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: bias.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let total = channels * spatial;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.add_channel_bias_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
 }

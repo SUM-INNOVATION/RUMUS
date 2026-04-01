@@ -67,4 +67,36 @@ pub trait Backend {
     ///
     /// `src` is `(m x n)`, `dst` is `(n,)` pre-zeroed.
     fn sum_rows(src: &[f32], dst: &mut [f32], m: usize, n: usize);
+
+    // ----- Convolution helpers ------------------------------------------------
+
+    /// im2col: extract patches from `[C_in, H, W]` into `[C_in*K*K, out_h*out_w]`.
+    fn im2col(
+        src: &[f32], dst: &mut [f32],
+        c_in: usize, h: usize, w: usize,
+        k: usize, stride: usize, pad: usize,
+        out_h: usize, out_w: usize,
+    );
+
+    /// col2im: scatter columns back to image, accumulating overlaps.
+    /// `dst` must be pre-zeroed.
+    fn col2im(
+        src: &[f32], dst: &mut [f32],
+        c_in: usize, h: usize, w: usize,
+        k: usize, stride: usize, pad: usize,
+        out_h: usize, out_w: usize,
+    );
+
+    /// Add channel bias: `dst[c*spatial+s] = src[c*spatial+s] + bias[c]`.
+    fn add_channel_bias(
+        src: &[f32], bias: &[f32], dst: &mut [f32],
+        channels: usize, spatial: usize,
+    );
+
+    /// Sum over spatial for each channel: `dst[c] = sum_s(src[c*spatial+s])`.
+    /// `dst` must be pre-zeroed.
+    fn sum_channel_bias_grad(
+        src: &[f32], dst: &mut [f32],
+        channels: usize, spatial: usize,
+    );
 }
