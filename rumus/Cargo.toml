@@ -1,15 +1,18 @@
 [package]
 name = "rumus"
-version = "0.1.0"
-edition = "2021"
+version = "0.1.2"
+readme = "README.md"
+edition = "2024"
 description = "A native-Rust deep learning framework with explicit memory safety and hardware acceleration"
+license = "MIT"
+repository = "https://github.com/SUM-INNOVATION/RUMUS"
 
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]
-rumus-macros = { path = "../rumus-macros" }
+rumus-macros = { version = "0.1.2", path = "../rumus-macros" }
 safetensors = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
 parking_lot = "0.12"
