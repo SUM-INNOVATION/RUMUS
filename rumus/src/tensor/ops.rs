@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, BmmBackward,
+    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, BmmBackward, TransposeBackward,
     BroadcastAddBackward, BroadcastMulBackward, BroadcastSubBackward, CrossEntropyBackward,
     DropoutBackward, EmbeddingBackward, FlattenBackward, GeluBackward, Im2ColBackward,
     LayerNormBackward, LeakyReluBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward,
@@ -1448,11 +1448,84 @@ impl Tensor {
         }
     }
 
-    /// Transpose the last two dimensions of a 3D+ tensor.  Zero-copy view.
+    /// Tracked contiguous: if non-contiguous, materializes a copy while
+    /// preserving the autograd chain via `ReshapeBackward`.
+    /// If already contiguous, zero-copy (same as `reshape_tracked` with same shape).
+    pub fn contiguous_tracked(&self) -> Tensor {
+        if self.is_contiguous() {
+            // Zero-copy: same storage, contiguous layout, tracked.
+            let shape = self.shape().to_vec();
+            return self.reshape_tracked(shape);
+        }
+        // Non-contiguous: copy data, track via ReshapeBackward.
+        let c = self.contiguous(); // untracked copy
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_gid = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Reshape(ReshapeBackward {
+                        input_version: VersionSnapshot::new(in_gid, &self.storage),
+                        original_shape: self.shape().to_vec(),
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+            Tensor {
+                storage: c.storage,
+                layout: c.layout,
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            c
+        }
+    }
+
+    /// Tracked transpose: swaps two dimensions while preserving autograd.
+    ///
+    /// Zero-copy view (clones storage, swaps shape/strides).
+    /// Records `TransposeBackward` on the tape so gradients flow through.
+    pub fn transpose_tracked(&self, dim0: usize, dim1: usize) -> Tensor {
+        let out_storage = self.storage.clone();
+        let out_layout = self.layout.transposed(dim0, dim1);
+        let result_shape = out_layout.shape().to_vec();
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_gid = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Transpose(TransposeBackward {
+                        input_version: VersionSnapshot::new(in_gid, &self.storage),
+                        dim0, dim1,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+            Tensor {
+                storage: out_storage, layout: out_layout,
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: out_layout, state: AutogradState::None }
+        }
+    }
+
+    /// Transpose the last two dimensions of a 3D+ tensor. Tracked.
     pub fn batched_transpose(&self) -> Tensor {
         assert!(self.ndim() >= 2, "batched_transpose: need >= 2 dims");
         let ndim = self.ndim();
-        self.transpose(ndim - 2, ndim - 1)
+        self.transpose_tracked(ndim - 2, ndim - 1)
     }
 
     // === Softmax ==============================================================
@@ -1722,14 +1795,18 @@ impl Tensor {
     }
 
     pub fn broadcast_mul(&self, rhs: &Tensor) -> Tensor {
+        let lhs_st = self.storage.clone();
+        let lhs_ly = self.layout.clone();
+        let rhs_st = rhs.storage.clone();
+        let rhs_ly = rhs.layout.clone();
         broadcast_binary_op(self, rhs, |a, b| a * b,
             |lhs_v, rhs_v, lhs_bi, rhs_bi, out_shape| {
                 BackwardOp::BroadcastMul(BroadcastMulBackward {
-                    lhs_storage: StorageHandle::new(Vec::new()), // placeholder
-                    lhs_layout: Layout::contiguous(vec![]),
+                    lhs_storage: lhs_st,
+                    lhs_layout: lhs_ly,
                     lhs_version: lhs_v,
-                    rhs_storage: StorageHandle::new(Vec::new()),
-                    rhs_layout: Layout::contiguous(vec![]),
+                    rhs_storage: rhs_st,
+                    rhs_layout: rhs_ly,
                     rhs_version: rhs_v,
                     lhs_broadcast: lhs_bi, rhs_broadcast: rhs_bi,
                     output_shape: out_shape,

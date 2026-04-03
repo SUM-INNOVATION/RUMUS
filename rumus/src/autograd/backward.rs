@@ -449,6 +449,15 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 grads.accumulate(entry.inputs[0], grad_input)?;
             }
 
+            BackwardOp::Transpose(bw) => {
+                bw.input_version.check()?;
+                // Reverse the transpose: transpose(grad, dim0, dim1).
+                // Uses untracked transpose (view op) — correct since we're
+                // inside the backward engine, not building a new graph.
+                let grad_input = out_grad.transpose(bw.dim0, bw.dim1);
+                grads.accumulate(entry.inputs[0], grad_input)?;
+            }
+
             BackwardOp::Bmm(bw) => {
                 bw.lhs_version.check()?;
                 bw.rhs_version.check()?;

@@ -254,6 +254,15 @@ pub struct DropoutBackward {
     pub mask_layout: Layout,
 }
 
+/// Backward for tracked `transpose(dim0, dim1)`.
+/// `grad_input = transpose(grad_output, dim0, dim1)` — reverse the swap.
+#[derive(Debug)]
+pub struct TransposeBackward {
+    pub input_version: VersionSnapshot,
+    pub dim0: usize,
+    pub dim1: usize,
+}
+
 /// Backward for `bmm(A, B)`.
 /// `grad_A = bmm(grad_C, B^T)`, `grad_B = bmm(A^T, grad_C)`.
 #[derive(Debug)]
@@ -412,6 +421,7 @@ pub enum BackwardOp {
     Tanh(TanhBackward),
     Gelu(GeluBackward),
     LeakyRelu(LeakyReluBackward),
+    Transpose(TransposeBackward),
     Bmm(BmmBackward),
     Softmax(SoftmaxBackward),
     LayerNorm(LayerNormBackward),
