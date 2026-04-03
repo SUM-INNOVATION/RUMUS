@@ -291,6 +291,47 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn bmm(a: &[f32], b: &[f32], dst: &mut [f32], batch: usize, m: usize, k: usize, n: usize) {
+        for bi in 0..batch {
+            let a_off = bi * m * k;
+            let b_off = bi * k * n;
+            let c_off = bi * m * n;
+            for i in 0..m {
+                for p in 0..k {
+                    let a_ip = a[a_off + i * k + p];
+                    for j in 0..n {
+                        dst[c_off + i * n + j] += a_ip * b[b_off + p * n + j];
+                    }
+                }
+            }
+        }
+    }
+
+    fn softmax_forward(input: &[f32], output: &mut [f32], num_rows: usize, row_size: usize) {
+        for r in 0..num_rows {
+            let base = r * row_size;
+            let row = &input[base..base + row_size];
+            let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f32 = row.iter().map(|&x| (x - max_val).exp()).sum();
+            for j in 0..row_size {
+                output[base + j] = (input[base + j] - max_val).exp() / sum_exp;
+            }
+        }
+    }
+
+    fn softmax_backward(saved_out: &[f32], grad_out: &[f32], grad_in: &mut [f32], num_rows: usize, row_size: usize) {
+        for r in 0..num_rows {
+            let base = r * row_size;
+            let mut dot = 0.0f32;
+            for j in 0..row_size {
+                dot += grad_out[base + j] * saved_out[base + j];
+            }
+            for j in 0..row_size {
+                grad_in[base + j] = saved_out[base + j] * (grad_out[base + j] - dot);
+            }
+        }
+    }
+
     fn layer_norm_forward(
         input: &[f32], weight: &[f32], bias: &[f32],
         output: &mut [f32], save: &mut [f32],

@@ -61,6 +61,13 @@ pub struct PipelineCache {
     pub ln_backward_pipeline: wgpu::ComputePipeline,
     pub ln_grad_weight_pipeline: wgpu::ComputePipeline,
 
+    // Bmm (reuses matmul_layout)
+    pub bmm_pipeline: wgpu::ComputePipeline,
+
+    // Softmax (forward: unary_layout, backward: binary_layout)
+    pub softmax_forward_pipeline: wgpu::ComputePipeline,
+    pub softmax_backward_pipeline: wgpu::ComputePipeline,
+
     // Embedding (reuses binary_layout)
     pub embedding_pipeline: wgpu::ComputePipeline,
 
@@ -206,6 +213,19 @@ impl PipelineCache {
             source: wgpu::ShaderSource::Wgsl(
                 include_str!("shaders/broadcast.wgsl").into(),
             ),
+        });
+
+        let bmm_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bmm"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/bmm.wgsl").into()),
+        });
+        let softmax_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("softmax"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/softmax.wgsl").into()),
+        });
+        let softmax_bw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("softmax_bw"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/softmax_bw.wgsl").into()),
         });
 
         let ln_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -392,6 +412,10 @@ impl PipelineCache {
         let broadcast_mul_pipeline = make_pipeline(&binary_layout, &broadcast_module, "broadcast_mul_kernel", "bc_mul");
         let reduce_sum_pipeline = make_pipeline(&unary_layout, &broadcast_module, "reduce_sum_kernel", "reduce_sum");
 
+        let bmm_pipeline = make_pipeline(&matmul_layout, &bmm_module, "bmm_kernel", "bmm");
+        let softmax_forward_pipeline = make_pipeline(&unary_layout, &softmax_module, "softmax_forward_kernel", "sm_fwd");
+        let softmax_backward_pipeline = make_pipeline(&binary_layout, &softmax_bw_module, "softmax_backward_kernel", "sm_bw");
+
         let ln_forward_pipeline = make_pipeline(&ln_layout, &ln_module, "layer_norm_forward_kernel", "ln_fwd");
         let ln_backward_pipeline = make_pipeline(&ln_bw_layout, &ln_bw_module, "layer_norm_backward_kernel", "ln_bw");
         let ln_grad_weight_pipeline = make_pipeline(&ln_bw_layout, &ln_gw_module, "layer_norm_grad_weight_kernel", "ln_gw");
@@ -419,6 +443,8 @@ impl PipelineCache {
             ce_layout, ce_forward_pipeline, ce_reduce_pipeline,
             broadcast_add_pipeline, broadcast_sub_pipeline, broadcast_mul_pipeline,
             reduce_sum_pipeline,
+            bmm_pipeline,
+            softmax_forward_pipeline, softmax_backward_pipeline,
             ln_layout, ln_forward_pipeline,
             ln_bw_layout, ln_backward_pipeline, ln_grad_weight_pipeline,
             embedding_pipeline,

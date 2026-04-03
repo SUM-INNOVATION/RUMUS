@@ -254,6 +254,33 @@ pub struct DropoutBackward {
     pub mask_layout: Layout,
 }
 
+/// Backward for `bmm(A, B)`.
+/// `grad_A = bmm(grad_C, B^T)`, `grad_B = bmm(A^T, grad_C)`.
+#[derive(Debug)]
+pub struct BmmBackward {
+    pub lhs_storage: StorageHandle,
+    pub lhs_layout: Layout,
+    pub lhs_version: VersionSnapshot,
+    pub rhs_storage: StorageHandle,
+    pub rhs_layout: Layout,
+    pub rhs_version: VersionSnapshot,
+    pub batch: usize,
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+}
+
+/// Backward for `softmax(input)`.  Saves **output**.
+/// `grad_input = saved * (grad_out - dot)` where `dot = Σ grad_out * saved`.
+#[derive(Debug)]
+pub struct SoftmaxBackward {
+    pub output_storage: StorageHandle,
+    pub output_layout: Layout,
+    pub input_version: VersionSnapshot,
+    pub num_rows: usize,
+    pub row_size: usize,
+}
+
 /// Backward for `layer_norm`.
 ///
 /// Kernel 1: per-instance grad_input via c1/c2 reductions.
@@ -385,6 +412,8 @@ pub enum BackwardOp {
     Tanh(TanhBackward),
     Gelu(GeluBackward),
     LeakyRelu(LeakyReluBackward),
+    Bmm(BmmBackward),
+    Softmax(SoftmaxBackward),
     LayerNorm(LayerNormBackward),
     Embedding(EmbeddingBackward),
     BroadcastAdd(BroadcastAddBackward),

@@ -449,6 +449,72 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 grads.accumulate(entry.inputs[0], grad_input)?;
             }
 
+            BackwardOp::Bmm(bw) => {
+                bw.lhs_version.check()?;
+                bw.rhs_version.check()?;
+                let saved_a = Tensor::from_storage_and_layout(bw.lhs_storage.clone(), bw.lhs_layout.clone());
+                let saved_b = Tensor::from_storage_and_layout(bw.rhs_storage.clone(), bw.rhs_layout.clone());
+                // grad_A = bmm(grad_C, B^T): [B,M,N] @ [B,N,K] → [B,M,K]
+                let b_t = saved_b.batched_transpose();
+                let grad_a = out_grad.bmm(&b_t);
+                // grad_B = bmm(A^T, grad_C): [B,K,M] @ [B,M,N] → [B,K,N]
+                let a_t = saved_a.batched_transpose();
+                let grad_b = a_t.bmm(&out_grad);
+                grads.accumulate(entry.inputs[0], grad_a)?;
+                grads.accumulate(entry.inputs[1], grad_b)?;
+            }
+
+            BackwardOp::Softmax(bw) => {
+                bw.input_version.check()?;
+                let saved_out = Tensor::from_storage_and_layout(bw.output_storage.clone(), bw.output_layout.clone());
+                let (num_rows, row_size) = (bw.num_rows, bw.row_size);
+
+                #[cfg(feature = "gpu")]
+                if out_grad.storage.is_gpu() {
+                    use crate::backend::gpu::{
+                        compute as gpu_compute,
+                        context::{GpuContext, STORAGE_USAGE},
+                    };
+                    let ctx = GpuContext::get().expect("GPU required");
+                    let so_c = saved_out.contiguous();
+                    let og_c = out_grad.contiguous();
+                    let so_buf = so_c.storage.gpu_buffer();
+                    let og_buf = og_c.storage.gpu_buffer();
+                    let gi_buf = ctx.pool.acquire(&ctx.device, (num_rows * row_size * 4) as u64, STORAGE_USAGE);
+                    gpu_compute::softmax_backward_dispatch(
+                        ctx, &so_buf, &og_buf, &gi_buf,
+                        num_rows as u32, row_size as u32,
+                    );
+                    drop(so_buf); drop(og_buf);
+                    let gi = Tensor::from_storage_and_layout(
+                        crate::tensor::StorageHandle::new_gpu(gi_buf, num_rows * row_size),
+                        crate::tensor::Layout::contiguous(out_grad.shape().to_vec()),
+                    );
+                    grads.accumulate(entry.inputs[0], gi)?;
+                } else {
+                    let so_c = saved_out.contiguous();
+                    let og_c = out_grad.contiguous();
+                    let sog = so_c.storage.data();
+                    let ogg = og_c.storage.data();
+                    let mut gi = CpuBackend::zeros(num_rows * row_size);
+                    CpuBackend::softmax_backward(&sog, &ogg, &mut gi, num_rows, row_size);
+                    drop(sog); drop(ogg);
+                    grads.accumulate(entry.inputs[0], Tensor::new(gi, out_grad.shape().to_vec()))?;
+                }
+
+                #[cfg(not(feature = "gpu"))]
+                {
+                    let so_c = saved_out.contiguous();
+                    let og_c = out_grad.contiguous();
+                    let sog = so_c.storage.data();
+                    let ogg = og_c.storage.data();
+                    let mut gi = CpuBackend::zeros(num_rows * row_size);
+                    CpuBackend::softmax_backward(&sog, &ogg, &mut gi, num_rows, row_size);
+                    drop(sog); drop(ogg);
+                    grads.accumulate(entry.inputs[0], Tensor::new(gi, out_grad.shape().to_vec()))?;
+                }
+            }
+
             BackwardOp::LayerNorm(bw) => {
                 bw.input_version.check()?;
                 bw.weight_version.check()?;

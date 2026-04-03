@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, BroadcastAddBackward,
-    BroadcastMulBackward, BroadcastSubBackward, CrossEntropyBackward, DropoutBackward,
-    EmbeddingBackward, FlattenBackward, GeluBackward, Im2ColBackward, LayerNormBackward,
-    LeakyReluBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward, MulBackward,
-    ReluBackward, ReshapeBackward, SigmoidBackward, StackBackward, SubBackward, TanhBackward,
-    TapeEntry, VersionSnapshot,
+    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, BmmBackward,
+    BroadcastAddBackward, BroadcastMulBackward, BroadcastSubBackward, CrossEntropyBackward,
+    DropoutBackward, EmbeddingBackward, FlattenBackward, GeluBackward, Im2ColBackward,
+    LayerNormBackward, LeakyReluBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward,
+    MulBackward, ReluBackward, ReshapeBackward, SigmoidBackward, SoftmaxBackward,
+    StackBackward, SubBackward, TanhBackward, TapeEntry, VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
 #[cfg(feature = "gpu")]
@@ -1362,6 +1362,166 @@ impl Tensor {
             }
         } else {
             Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+        }
+    }
+
+    // === Batched MatMul =======================================================
+
+    /// Batched matrix multiplication: `[B, M, K] @ [B, K, N] → [B, M, N]`.
+    pub fn bmm(&self, rhs: &Tensor) -> Tensor {
+        assert_eq!(self.ndim(), 3, "bmm: lhs must be 3-D");
+        assert_eq!(rhs.ndim(), 3, "bmm: rhs must be 3-D");
+        let batch = self.shape()[0];
+        let m = self.shape()[1];
+        let k = self.shape()[2];
+        let n = rhs.shape()[2];
+        assert_eq!(rhs.shape()[0], batch, "bmm: batch mismatch");
+        assert_eq!(rhs.shape()[1], k, "bmm: inner dim mismatch");
+
+        let lhs_c = self.contiguous();
+        let rhs_c = rhs.contiguous();
+        let out_numel = batch * m * n;
+        let result_shape = vec![batch, m, n];
+
+        #[cfg(feature = "gpu")]
+        let out_storage = if either_gpu(&lhs_c, &rhs_c) {
+            let ctx = GpuContext::get().expect("GPU required");
+            let lb = lhs_c.storage.gpu_buffer();
+            let rb = rhs_c.storage.gpu_buffer();
+            let dst_buf = ctx.pool.acquire(&ctx.device, (out_numel * 4) as u64, STORAGE_USAGE);
+            {
+                let mut enc = ctx.device.create_command_encoder(&Default::default());
+                enc.clear_buffer(&dst_buf, 0, None);
+                ctx.queue.submit(std::iter::once(enc.finish()));
+            }
+            gpu_compute::bmm_dispatch(ctx, &lb, &rb, &dst_buf, batch as u32, m as u32, k as u32, n as u32);
+            drop(lb); drop(rb);
+            StorageHandle::new_gpu(dst_buf, out_numel)
+        } else {
+            let lg = lhs_c.storage.data();
+            let rg = rhs_c.storage.data();
+            let mut dst = CpuBackend::zeros(out_numel);
+            CpuBackend::bmm(&lg, &rg, &mut dst, batch, m, k, n);
+            drop(rg); drop(lg);
+            StorageHandle::new(dst)
+        };
+
+        #[cfg(not(feature = "gpu"))]
+        let out_storage = {
+            let lg = lhs_c.storage.data();
+            let rg = rhs_c.storage.data();
+            let mut dst = CpuBackend::zeros(out_numel);
+            CpuBackend::bmm(&lg, &rg, &mut dst, batch, m, k, n);
+            drop(rg); drop(lg);
+            StorageHandle::new(dst)
+        };
+
+        if should_record(self, rhs) {
+            let out_gid = context::next_grad_id();
+            let lhs_gid = require_grad_id(self).unwrap_or_else(context::next_grad_id);
+            let rhs_gid = require_grad_id(rhs).unwrap_or_else(context::next_grad_id);
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+            if let Some(m) = rhs.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Bmm(BmmBackward {
+                        lhs_storage: self.storage.clone(), lhs_layout: self.layout.clone(),
+                        lhs_version: VersionSnapshot::new(lhs_gid, &self.storage),
+                        rhs_storage: rhs.storage.clone(), rhs_layout: rhs.layout.clone(),
+                        rhs_version: VersionSnapshot::new(rhs_gid, &rhs.storage),
+                        batch, m, k, n,
+                    }),
+                    inputs: vec![lhs_gid, rhs_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+            Tensor {
+                storage: out_storage, layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+        }
+    }
+
+    /// Transpose the last two dimensions of a 3D+ tensor.  Zero-copy view.
+    pub fn batched_transpose(&self) -> Tensor {
+        assert!(self.ndim() >= 2, "batched_transpose: need >= 2 dims");
+        let ndim = self.ndim();
+        self.transpose(ndim - 2, ndim - 1)
+    }
+
+    // === Softmax ==============================================================
+
+    /// Row-wise softmax over the last dimension with Log-Sum-Exp stability.
+    ///
+    /// Input: `[..., D]`.  Output: same shape, each row sums to 1.
+    /// Saves the output for backward.
+    pub fn softmax(&self) -> Tensor {
+        let shape = self.shape().to_vec();
+        let row_size = *shape.last().expect("softmax: empty shape");
+        let num_rows = self.numel() / row_size;
+
+        let ic = self.contiguous();
+
+        #[cfg(feature = "gpu")]
+        let (out_storage, out_storage_for_save) = if ic.storage.is_gpu() {
+            let ctx = GpuContext::get().expect("GPU required");
+            let ib = ic.storage.gpu_buffer();
+            let ob = ctx.pool.acquire(&ctx.device, (self.numel() * 4) as u64, STORAGE_USAGE);
+            gpu_compute::softmax_forward_dispatch(ctx, &ib, &ob, num_rows as u32, row_size as u32);
+            drop(ib);
+            let sh = StorageHandle::new_gpu(ob, self.numel());
+            (sh.clone(), sh)
+        } else {
+            let ig = ic.storage.data();
+            let mut out = CpuBackend::zeros(self.numel());
+            CpuBackend::softmax_forward(&ig, &mut out, num_rows, row_size);
+            drop(ig);
+            let sh = StorageHandle::new(out);
+            (sh.clone(), sh)
+        };
+
+        #[cfg(not(feature = "gpu"))]
+        let (out_storage, out_storage_for_save) = {
+            let ig = ic.storage.data();
+            let mut out = CpuBackend::zeros(self.numel());
+            CpuBackend::softmax_forward(&ig, &mut out, num_rows, row_size);
+            drop(ig);
+            let sh = StorageHandle::new(out);
+            (sh.clone(), sh)
+        };
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_gid = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Softmax(SoftmaxBackward {
+                        output_storage: out_storage_for_save,
+                        output_layout: Layout::contiguous(shape.clone()),
+                        input_version: VersionSnapshot::new(in_gid, &self.storage),
+                        num_rows, row_size,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+            Tensor {
+                storage: out_storage, layout: Layout::contiguous(shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(shape), state: AutogradState::None }
         }
     }
 

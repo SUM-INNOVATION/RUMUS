@@ -239,6 +239,26 @@ pub(crate) struct EmbeddingParams {
     pub _pad1: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct BmmParams {
+    pub batch: u32,
+    pub m: u32,
+    pub k: u32,
+    pub n: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct SoftmaxParams {
+    pub num_rows: u32,
+    pub row_size: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<BmmParams>() == 16);
+const _: () = assert!(std::mem::size_of::<SoftmaxParams>() == 16);
 const _: () = assert!(std::mem::size_of::<LayerNormParams>() == 16);
 const _: () = assert!(std::mem::size_of::<LayerNormBwParams>() == 16);
 const _: () = assert!(std::mem::size_of::<EmbeddingParams>() == 16);
@@ -1487,6 +1507,103 @@ pub(crate) fn embedding_forward(
         pass.set_pipeline(&ctx.pipelines.embedding_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Batched MatMul
+// ---------------------------------------------------------------------------
+
+pub(crate) fn bmm_dispatch(
+    ctx: &GpuContext,
+    a: &wgpu::Buffer, b: &wgpu::Buffer, out: &wgpu::Buffer,
+    batch: u32, m: u32, k: u32, n: u32,
+) {
+    let params = BmmParams { batch, m, k, n };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("bmm_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.matmul_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.bmm_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((n + 15) / 16, (m + 15) / 16, batch);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Softmax
+// ---------------------------------------------------------------------------
+
+pub(crate) fn softmax_forward_dispatch(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer, output: &wgpu::Buffer,
+    num_rows: u32, row_size: u32,
+) {
+    let params = SoftmaxParams { num_rows, row_size, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("sm_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.softmax_forward_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(num_rows, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+pub(crate) fn softmax_backward_dispatch(
+    ctx: &GpuContext,
+    saved_out: &wgpu::Buffer, grad_out: &wgpu::Buffer, grad_in: &wgpu::Buffer,
+    num_rows: u32, row_size: u32,
+) {
+    let params = SoftmaxParams { num_rows, row_size, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("smbw_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.binary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: saved_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: grad_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: grad_in.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.softmax_backward_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(num_rows, 1, 1);
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
 }

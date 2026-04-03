@@ -143,6 +143,15 @@ pub trait Backend {
     fn leaky_relu(src: &[f32], dst: &mut [f32], alpha: f32);
     fn leaky_relu_backward(saved_input: &[f32], out_grad: &[f32], dst: &mut [f32], alpha: f32);
 
+    // ----- Batched MatMul ------------------------------------------------------
+
+    fn bmm(a: &[f32], b: &[f32], dst: &mut [f32], batch: usize, m: usize, k: usize, n: usize);
+
+    // ----- Softmax -------------------------------------------------------------
+
+    fn softmax_forward(input: &[f32], output: &mut [f32], num_rows: usize, row_size: usize);
+    fn softmax_backward(saved_out: &[f32], grad_out: &[f32], grad_in: &mut [f32], num_rows: usize, row_size: usize);
+
     // ----- LayerNorm -----------------------------------------------------------
 
     fn layer_norm_forward(

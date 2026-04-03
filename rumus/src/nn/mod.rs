@@ -1,6 +1,7 @@
 //! Neural network building blocks: parameters, modules, layers, losses, and IO.
 
 mod activations;
+mod attention;
 mod conv;
 mod dropout;
 mod embedding;
@@ -14,6 +15,7 @@ mod parameter;
 mod pool;
 
 pub use activations::{gelu, leaky_relu, relu, sigmoid, tanh};
+pub use attention::scaled_dot_product_attention;
 pub use conv::Conv2d;
 pub use dropout::Dropout;
 pub use embedding::Embedding;
