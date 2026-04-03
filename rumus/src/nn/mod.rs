@@ -11,7 +11,7 @@ mod module;
 mod parameter;
 mod pool;
 
-pub use activations::relu;
+pub use activations::{gelu, leaky_relu, relu, sigmoid, tanh};
 pub use conv::Conv2d;
 pub use dropout::Dropout;
 pub use flatten::Flatten;

@@ -48,6 +48,15 @@ pub struct PipelineCache {
     pub ce_forward_pipeline: wgpu::ComputePipeline,
     pub ce_reduce_pipeline: wgpu::ComputePipeline,
 
+    // Broadcast binary ops + reduce_sum
+    pub broadcast_add_pipeline: wgpu::ComputePipeline,
+    pub broadcast_sub_pipeline: wgpu::ComputePipeline,
+    pub broadcast_mul_pipeline: wgpu::ComputePipeline,
+    pub reduce_sum_pipeline: wgpu::ComputePipeline,
+
+    // Fused stride-aware scale (for negate, etc.)
+    pub fused_scale_pipeline: wgpu::ComputePipeline,
+
     // Broadcast scale: dst[i] = src[i] * scalar_buf[0]
     pub broadcast_scale_pipeline: wgpu::ComputePipeline,
 
@@ -182,6 +191,20 @@ impl PipelineCache {
             ),
         });
 
+        let broadcast_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("broadcast"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/broadcast.wgsl").into(),
+            ),
+        });
+
+        let fused_scale_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fused_scale"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/fused_scale.wgsl").into(),
+            ),
+        });
+
         let broadcast_scale_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("broadcast_scale"),
             source: wgpu::ShaderSource::Wgsl(
@@ -310,6 +333,13 @@ impl PipelineCache {
         let adam_pipeline = make_pipeline(&adam_layout, &optim_module, "adam_step", "adam");
 
         let adamw_pipeline = make_pipeline(&adam_layout, &adamw_module, "adamw_step", "adamw");
+        let broadcast_add_pipeline = make_pipeline(&binary_layout, &broadcast_module, "broadcast_add_kernel", "bc_add");
+        let broadcast_sub_pipeline = make_pipeline(&binary_layout, &broadcast_module, "broadcast_sub_kernel", "bc_sub");
+        let broadcast_mul_pipeline = make_pipeline(&binary_layout, &broadcast_module, "broadcast_mul_kernel", "bc_mul");
+        let reduce_sum_pipeline = make_pipeline(&unary_layout, &broadcast_module, "reduce_sum_kernel", "reduce_sum");
+
+        let fused_scale_pipeline = make_pipeline(&unary_layout, &fused_scale_module, "fused_scale_kernel", "fused_scale");
+
         let broadcast_scale_pipeline = make_pipeline(&binary_layout, &broadcast_scale_module, "broadcast_scale_kernel", "broadcast_scale");
         let ce_forward_pipeline = make_pipeline(&ce_layout, &ce_module, "cross_entropy_forward_kernel", "ce_forward");
         let ce_reduce_pipeline = make_pipeline(&unary_layout, &ce_module, "reduce_loss_kernel", "ce_reduce");
@@ -328,6 +358,9 @@ impl PipelineCache {
             sgd_layout, sgd_pipeline,
             adam_layout, adam_pipeline, adamw_pipeline,
             ce_layout, ce_forward_pipeline, ce_reduce_pipeline,
+            broadcast_add_pipeline, broadcast_sub_pipeline, broadcast_mul_pipeline,
+            reduce_sum_pipeline,
+            fused_scale_pipeline,
             broadcast_scale_pipeline,
             contiguous_copy_pipeline,
             dropout_pipeline, fused_dropout_pipeline,

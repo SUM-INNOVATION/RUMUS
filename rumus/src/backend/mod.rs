@@ -132,6 +132,17 @@ pub trait Backend {
         numel: usize, p: f32, step: u64,
     );
 
+    // ----- Advanced activations ------------------------------------------------
+
+    fn sigmoid(src: &[f32], dst: &mut [f32]);
+    fn sigmoid_backward(saved_out: &[f32], out_grad: &[f32], dst: &mut [f32]);
+    fn tanh_act(src: &[f32], dst: &mut [f32]);
+    fn tanh_backward(saved_out: &[f32], out_grad: &[f32], dst: &mut [f32]);
+    fn gelu(src: &[f32], dst: &mut [f32]);
+    fn gelu_backward(saved_input: &[f32], out_grad: &[f32], dst: &mut [f32]);
+    fn leaky_relu(src: &[f32], dst: &mut [f32], alpha: f32);
+    fn leaky_relu_backward(saved_input: &[f32], out_grad: &[f32], dst: &mut [f32], alpha: f32);
+
     // ----- Loss ----------------------------------------------------------------
 
     /// Cross-entropy loss forward: computes per-batch loss AND gradient in one pass.

@@ -8,6 +8,103 @@ use crate::autograd::{AutogradError, GradientStore};
 use crate::backend::{Backend, CpuBackend};
 use crate::tensor::{GradId, Tensor};
 
+/// If broadcasting occurred, reduce (sum) the gradient along the broadcast dims
+/// to match the operand's original shape.  If no broadcasting, return as-is.
+/// Routes to GPU reduce_sum kernel when grad is GPU-resident.
+fn reduce_if_broadcast(
+    grad: &Tensor,
+    info: &Option<crate::tensor::broadcast::BroadcastInfo>,
+) -> Tensor {
+    match info {
+        None => grad.clone(),
+        Some(bi) => {
+            let out_numel: usize = bi.original_shape.iter().product();
+
+            #[cfg(feature = "gpu")]
+            if grad.storage.is_gpu() {
+                use crate::backend::gpu::{
+                    compute as gpu_compute,
+                    context::{GpuContext, STORAGE_USAGE},
+                };
+                let ctx = GpuContext::get().expect("GPU required");
+                let gc = grad.contiguous();
+                let gb = gc.storage.gpu_buffer();
+                let dst_buf = ctx.pool.acquire(&ctx.device, (out_numel * 4) as u64, STORAGE_USAGE);
+                // Zero the output buffer before accumulation.
+                {
+                    let mut enc = ctx.device.create_command_encoder(&Default::default());
+                    enc.clear_buffer(&dst_buf, 0, None);
+                    ctx.queue.submit(std::iter::once(enc.finish()));
+                }
+                let params = gpu_compute::make_reduce_sum_params(
+                    grad.shape(), &bi.reduced_dims, out_numel,
+                );
+                gpu_compute::reduce_sum_gpu(ctx, &gb, &dst_buf, &params);
+                drop(gb);
+                return Tensor::from_storage_and_layout(
+                    crate::tensor::StorageHandle::new_gpu(dst_buf, out_numel),
+                    crate::tensor::Layout::contiguous(bi.original_shape.clone()),
+                );
+            }
+
+            // CPU path.
+            let gc = grad.contiguous();
+            let guard = gc.storage.data();
+            let mut dst = CpuBackend::zeros(out_numel);
+            crate::tensor::broadcast::cpu_reduce_sum(
+                &guard, &mut dst, grad.shape(), &bi.reduced_dims,
+            );
+            drop(guard);
+            Tensor::new(dst, bi.original_shape.clone())
+        }
+    }
+}
+
+/// Negate a tensor on-device (GPU) or host (CPU).
+///
+/// GPU path: dispatches the fused stride-aware `fused_scale_kernel` with
+/// `scalar = -1.0`.  Reads directly from the (potentially non-contiguous)
+/// source buffer using strides — zero intermediate VRAM allocation, no
+/// `.contiguous()` call.
+/// CPU path: makes contiguous then `CpuBackend::scale`.
+fn negate_tensor(t: &Tensor) -> Tensor {
+    let numel = t.numel();
+    let shape = t.shape().to_vec();
+
+    #[cfg(feature = "gpu")]
+    if t.storage.is_gpu() {
+        use crate::backend::gpu::{
+            compute as gpu_compute,
+            context::{GpuContext, STORAGE_USAGE},
+        };
+        let ctx = GpuContext::get().expect("GPU required");
+        let tb = t.storage.gpu_buffer();
+        let dst_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+
+        let strides = t.strides();
+        let offset = t.layout.offset();
+        let ndim = t.ndim();
+        let suffix = crate::tensor::broadcast::suffix_products(&shape);
+
+        let params = gpu_compute::make_fused_scale_params(
+            numel, -1.0, ndim, offset, &shape, strides, &suffix,
+        );
+        gpu_compute::fused_scale(ctx, &tb, &dst_buf, &params);
+        drop(tb);
+        return Tensor::from_storage_and_layout(
+            crate::tensor::StorageHandle::new_gpu(dst_buf, numel),
+            crate::tensor::Layout::contiguous(shape),
+        );
+    }
+
+    let tc = t.contiguous();
+    let guard = tc.storage.data();
+    let mut dst = CpuBackend::zeros(numel);
+    CpuBackend::scale(&guard, &mut dst, -1.0);
+    drop(guard);
+    Tensor::new(dst, shape)
+}
+
 /// Execute the backward pass from `tensor`, returning accumulated gradients.
 ///
 /// See module-level docs for the full Kahn's algorithm description.
@@ -73,14 +170,8 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
             BackwardOp::Sub(bw) => {
                 bw.lhs_version.check()?;
                 bw.rhs_version.check()?;
-                // ∂L/∂a = ∂L/∂c
                 grads.accumulate(entry.inputs[0], out_grad.clone())?;
-                // ∂L/∂b = -∂L/∂c
-                let og_guard = out_grad.storage.data();
-                let mut neg = CpuBackend::zeros(out_grad.numel());
-                CpuBackend::scale(&og_guard, &mut neg, -1.0);
-                drop(og_guard);
-                let grad_rhs = Tensor::new(neg, out_grad.shape().to_vec());
+                let grad_rhs = negate_tensor(&out_grad);
                 grads.accumulate(entry.inputs[1], grad_rhs)?;
             }
 
@@ -356,6 +447,106 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 );
                 let grad_input = out_grad.mul(&saved_mask);
                 grads.accumulate(entry.inputs[0], grad_input)?;
+            }
+
+            BackwardOp::Sigmoid(bw) => {
+                bw.input_version.check()?;
+                let saved_out = Tensor::from_storage_and_layout(
+                    bw.output_storage.clone(), bw.output_layout.clone(),
+                );
+                let sc = saved_out.contiguous();
+                let og = out_grad.contiguous();
+                let sg = sc.storage.data();
+                let ogg = og.storage.data();
+                let mut dst = CpuBackend::zeros(out_grad.numel());
+                CpuBackend::sigmoid_backward(&sg, &ogg, &mut dst);
+                drop(sg); drop(ogg);
+                grads.accumulate(entry.inputs[0], Tensor::new(dst, out_grad.shape().to_vec()))?;
+            }
+
+            BackwardOp::Tanh(bw) => {
+                bw.input_version.check()?;
+                let saved_out = Tensor::from_storage_and_layout(
+                    bw.output_storage.clone(), bw.output_layout.clone(),
+                );
+                let sc = saved_out.contiguous();
+                let og = out_grad.contiguous();
+                let sg = sc.storage.data();
+                let ogg = og.storage.data();
+                let mut dst = CpuBackend::zeros(out_grad.numel());
+                CpuBackend::tanh_backward(&sg, &ogg, &mut dst);
+                drop(sg); drop(ogg);
+                grads.accumulate(entry.inputs[0], Tensor::new(dst, out_grad.shape().to_vec()))?;
+            }
+
+            BackwardOp::Gelu(bw) => {
+                bw.input_version.check()?;
+                let saved_in = Tensor::from_storage_and_layout(
+                    bw.input_storage.clone(), bw.input_layout.clone(),
+                );
+                let sc = saved_in.contiguous();
+                let og = out_grad.contiguous();
+                let sg = sc.storage.data();
+                let ogg = og.storage.data();
+                let mut dst = CpuBackend::zeros(out_grad.numel());
+                CpuBackend::gelu_backward(&sg, &ogg, &mut dst);
+                drop(sg); drop(ogg);
+                grads.accumulate(entry.inputs[0], Tensor::new(dst, out_grad.shape().to_vec()))?;
+            }
+
+            BackwardOp::LeakyRelu(bw) => {
+                bw.input_version.check()?;
+                let saved_in = Tensor::from_storage_and_layout(
+                    bw.input_storage.clone(), bw.input_layout.clone(),
+                );
+                let sc = saved_in.contiguous();
+                let og = out_grad.contiguous();
+                let sg = sc.storage.data();
+                let ogg = og.storage.data();
+                let mut dst = CpuBackend::zeros(out_grad.numel());
+                CpuBackend::leaky_relu_backward(&sg, &ogg, &mut dst, bw.alpha);
+                drop(sg); drop(ogg);
+                grads.accumulate(entry.inputs[0], Tensor::new(dst, out_grad.shape().to_vec()))?;
+            }
+
+            BackwardOp::BroadcastAdd(bw) => {
+                bw.lhs_version.check()?;
+                bw.rhs_version.check()?;
+                let grad_lhs = reduce_if_broadcast(&out_grad, &bw.lhs_broadcast);
+                let grad_rhs = reduce_if_broadcast(&out_grad, &bw.rhs_broadcast);
+                grads.accumulate(entry.inputs[0], grad_lhs)?;
+                grads.accumulate(entry.inputs[1], grad_rhs)?;
+            }
+
+            BackwardOp::BroadcastSub(bw) => {
+                bw.lhs_version.check()?;
+                bw.rhs_version.check()?;
+                let grad_lhs = reduce_if_broadcast(&out_grad, &bw.lhs_broadcast);
+                // Negate out_grad for the RHS: ∂(A-B)/∂B = -1.
+                // GPU path: dispatch scale kernel with scalar -1.0 (uniform,
+                // never touches host memory as tensor data).
+                // CPU path: CpuBackend::scale.
+                let neg_og = negate_tensor(&out_grad);
+                let grad_rhs = reduce_if_broadcast(&neg_og, &bw.rhs_broadcast);
+                grads.accumulate(entry.inputs[0], grad_lhs)?;
+                grads.accumulate(entry.inputs[1], grad_rhs)?;
+            }
+
+            BackwardOp::BroadcastMul(bw) => {
+                bw.lhs_version.check()?;
+                bw.rhs_version.check()?;
+                let saved_lhs = Tensor::from_storage_and_layout(
+                    bw.lhs_storage.clone(), bw.lhs_layout.clone(),
+                );
+                let saved_rhs = Tensor::from_storage_and_layout(
+                    bw.rhs_storage.clone(), bw.rhs_layout.clone(),
+                );
+                let gl = out_grad.broadcast_mul(&saved_rhs);
+                let gr = out_grad.broadcast_mul(&saved_lhs);
+                let grad_lhs = reduce_if_broadcast(&gl, &bw.lhs_broadcast);
+                let grad_rhs = reduce_if_broadcast(&gr, &bw.rhs_broadcast);
+                grads.accumulate(entry.inputs[0], grad_lhs)?;
+                grads.accumulate(entry.inputs[1], grad_rhs)?;
             }
         }
 

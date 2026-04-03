@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, CrossEntropyBackward,
-    DropoutBackward, FlattenBackward, Im2ColBackward, MatmulBackward, MaxPool2dBackward,
-    MseLossBackward, MulBackward, ReluBackward, ReshapeBackward, StackBackward, SubBackward,
-    TapeEntry, VersionSnapshot,
+    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, BroadcastAddBackward,
+    BroadcastMulBackward, BroadcastSubBackward, CrossEntropyBackward, DropoutBackward,
+    FlattenBackward, GeluBackward, Im2ColBackward, LeakyReluBackward, MatmulBackward,
+    MaxPool2dBackward, MseLossBackward, MulBackward, ReluBackward, ReshapeBackward,
+    SigmoidBackward, StackBackward, SubBackward, TanhBackward, TapeEntry, VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
 #[cfg(feature = "gpu")]
@@ -160,6 +161,164 @@ fn gpu_binary(
     drop(lb);
     drop(rb);
     StorageHandle::new_gpu(dst, numel)
+}
+
+/// Helper for unary activations: runs CPU kernel, optionally saves output or
+/// input for backward, records on tape.
+fn unary_activation<F>(
+    input: &Tensor,
+    cpu_kernel: fn(&[f32], &mut [f32]),
+    save_output: bool,
+    _scalar: f32,
+    make_op: F,
+) -> Tensor
+where
+    F: FnOnce(StorageHandle, VersionSnapshot, StorageHandle, Vec<usize>) -> BackwardOp,
+{
+    let input_c = input.contiguous();
+    let in_guard = input_c.storage.data();
+    let numel = input.numel();
+    let mut dst = CpuBackend::zeros(numel);
+    cpu_kernel(&in_guard, &mut dst);
+    drop(in_guard);
+
+    let out_storage = StorageHandle::new(dst);
+    let result_shape = input.shape().to_vec();
+
+    if input.requires_grad() && !context::is_no_grad() {
+        let out_grad_id = context::next_grad_id();
+        let in_gid = input.grad_id().unwrap_or_else(context::next_grad_id);
+        let input_version = VersionSnapshot::new(in_gid, &input.storage);
+        if let Some(meta) = input.meta() {
+            meta.total_grads.fetch_add(1, Ordering::Relaxed);
+        }
+        let saved_storage = if save_output {
+            out_storage.clone()
+        } else {
+            input.storage.clone()
+        };
+        let op = make_op(out_storage.clone(), input_version, saved_storage, result_shape.clone());
+        let op_id = context::with_tape(|tape| {
+            tape.push(TapeEntry { op, inputs: vec![in_gid], outputs: vec![out_grad_id] })
+        });
+        Tensor {
+            storage: out_storage,
+            layout: Layout::contiguous(result_shape),
+            state: AutogradState::Tracked(Arc::new(TensorMeta {
+                requires_grad: true, grad_id: Some(out_grad_id), creator: op_id,
+                is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+            })),
+        }
+    } else {
+        Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+    }
+}
+
+/// Helper for broadcast binary ops.
+fn broadcast_binary_op<F>(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    cpu_op: fn(f32, f32) -> f32,
+    make_bw: F,
+) -> Tensor
+where
+    F: FnOnce(
+        VersionSnapshot, VersionSnapshot,
+        Option<crate::tensor::broadcast::BroadcastInfo>,
+        Option<crate::tensor::broadcast::BroadcastInfo>,
+        Vec<usize>,
+    ) -> BackwardOp,
+{
+    use crate::tensor::broadcast::{broadcast_shape, broadcast_strides, suffix_products, BroadcastInfo};
+
+    let out_shape = broadcast_shape(lhs.shape(), rhs.shape())
+        .expect("broadcast: shapes not broadcastable");
+    let a_strides = broadcast_strides(lhs.shape(), &out_shape);
+    let b_strides = broadcast_strides(rhs.shape(), &out_shape);
+    let out_numel: usize = out_shape.iter().product();
+    #[allow(unused_variables)]
+    let suffix = suffix_products(&out_shape);
+
+    // GPU path: dispatch broadcast WGSL kernel.
+    #[cfg(feature = "gpu")]
+    let out_storage = if either_gpu(lhs, rhs) {
+        let ctx = GpuContext::get().expect("GPU required");
+        let lhs_c = lhs.contiguous();
+        let rhs_c = rhs.contiguous();
+        let lb = lhs_c.storage.gpu_buffer();
+        let rb = rhs_c.storage.gpu_buffer();
+        let dst_buf = ctx.pool.acquire(&ctx.device, (out_numel * 4) as u64, STORAGE_USAGE);
+        let params = gpu_compute::make_broadcast_params(
+            out_numel, out_shape.len(), &suffix, &a_strides, &b_strides,
+        );
+        // Dispatch the correct kernel based on the op type.
+        // We use a function pointer passed via the cpu_op to determine which:
+        //   add: a + b,  sub: a - b,  mul: a * b
+        // Detect by calling cpu_op(1.0, 1.0) — hacky but avoids adding a 3rd param.
+        let test = cpu_op(2.0, 3.0);
+        if (test - 5.0).abs() < 0.01 {
+            gpu_compute::broadcast_add_gpu(ctx, &lb, &rb, &dst_buf, &params);
+        } else if (test - 6.0).abs() < 0.01 {
+            gpu_compute::broadcast_mul_gpu(ctx, &lb, &rb, &dst_buf, &params);
+        } else {
+            gpu_compute::broadcast_sub_gpu(ctx, &lb, &rb, &dst_buf, &params);
+        }
+        drop(lb); drop(rb);
+        StorageHandle::new_gpu(dst_buf, out_numel)
+    } else {
+        let lhs_c = lhs.contiguous();
+        let rhs_c = rhs.contiguous();
+        let lg = lhs_c.storage.data();
+        let rg = rhs_c.storage.data();
+        let mut dst = CpuBackend::zeros(out_numel);
+        crate::tensor::broadcast::cpu_broadcast_binary(
+            &lg, &rg, &mut dst, &out_shape, &a_strides, &b_strides, cpu_op,
+        );
+        drop(rg); drop(lg);
+        StorageHandle::new(dst)
+    };
+
+    #[cfg(not(feature = "gpu"))]
+    let out_storage = {
+        let lhs_c = lhs.contiguous();
+        let rhs_c = rhs.contiguous();
+        let lg = lhs_c.storage.data();
+        let rg = rhs_c.storage.data();
+        let mut dst = CpuBackend::zeros(out_numel);
+        crate::tensor::broadcast::cpu_broadcast_binary(
+            &lg, &rg, &mut dst, &out_shape, &a_strides, &b_strides, cpu_op,
+        );
+        drop(rg); drop(lg);
+        StorageHandle::new(dst)
+    };
+
+    if should_record(lhs, rhs) {
+        let out_grad_id = context::next_grad_id();
+        let lhs_gid = require_grad_id(lhs).unwrap_or_else(context::next_grad_id);
+        let rhs_gid = require_grad_id(rhs).unwrap_or_else(context::next_grad_id);
+        let lhs_version = VersionSnapshot::new(lhs_gid, &lhs.storage);
+        let rhs_version = VersionSnapshot::new(rhs_gid, &rhs.storage);
+        let lhs_bi = BroadcastInfo::new(lhs.shape(), &out_shape);
+        let rhs_bi = BroadcastInfo::new(rhs.shape(), &out_shape);
+
+        if let Some(meta) = lhs.meta() { meta.total_grads.fetch_add(1, Ordering::Relaxed); }
+        if let Some(meta) = rhs.meta() { meta.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+        let op = make_bw(lhs_version, rhs_version, lhs_bi, rhs_bi, out_shape.clone());
+        let op_id = context::with_tape(|tape| {
+            tape.push(TapeEntry { op, inputs: vec![lhs_gid, rhs_gid], outputs: vec![out_grad_id] })
+        });
+        Tensor {
+            storage: out_storage,
+            layout: Layout::contiguous(out_shape),
+            state: AutogradState::Tracked(Arc::new(TensorMeta {
+                requires_grad: true, grad_id: Some(out_grad_id), creator: op_id,
+                is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+            })),
+        }
+    } else {
+        Tensor { storage: out_storage, layout: Layout::contiguous(out_shape), state: AutogradState::None }
+    }
 }
 
 /// Select GPU or CPU path for a binary op.
@@ -1121,6 +1280,128 @@ impl Tensor {
                 state: AutogradState::None,
             }
         }
+    }
+
+    // === Advanced activations (sigmoid, tanh, gelu, leaky_relu) ===============
+
+    /// Macro-like helper for unary activations that save a tensor for backward.
+    /// `forward_cpu`: CPU kernel fn.  `save_output`: if true, save the output;
+    /// if false, save the input.  `bw_variant`: the BackwardOp constructor.
+
+    pub fn sigmoid(&self) -> Tensor {
+        unary_activation(self, CpuBackend::sigmoid, true, 0.0,
+            |_out_storage, in_version, saved_storage, shape| {
+                BackwardOp::Sigmoid(SigmoidBackward {
+                    output_storage: saved_storage,
+                    output_layout: Layout::contiguous(shape),
+                    input_version: in_version,
+                })
+            })
+    }
+
+    pub fn tanh_act(&self) -> Tensor {
+        unary_activation(self, CpuBackend::tanh_act, true, 0.0,
+            |_out_storage, in_version, saved_storage, shape| {
+                BackwardOp::Tanh(TanhBackward {
+                    output_storage: saved_storage,
+                    output_layout: Layout::contiguous(shape),
+                    input_version: in_version,
+                })
+            })
+    }
+
+    pub fn gelu(&self) -> Tensor {
+        unary_activation(self, CpuBackend::gelu, false, 0.0,
+            |_out_storage, in_version, saved_storage, shape| {
+                BackwardOp::Gelu(GeluBackward {
+                    input_storage: saved_storage,
+                    input_layout: Layout::contiguous(shape),
+                    input_version: in_version,
+                })
+            })
+    }
+
+    pub fn leaky_relu(&self, alpha: f32) -> Tensor {
+        let input_c = self.contiguous();
+        let in_guard = input_c.storage.data();
+        let numel = self.numel();
+        let mut dst = CpuBackend::zeros(numel);
+        CpuBackend::leaky_relu(&in_guard, &mut dst, alpha);
+        drop(in_guard);
+
+        let out_storage = StorageHandle::new(dst);
+        let result_shape = self.shape().to_vec();
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_grad_id = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+            if let Some(meta) = self.meta() {
+                meta.total_grads.fetch_add(1, Ordering::Relaxed);
+            }
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::LeakyRelu(LeakyReluBackward {
+                        input_storage: self.storage.clone(),
+                        input_layout: self.layout.clone(),
+                        input_version,
+                        alpha,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_grad_id],
+                })
+            });
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_grad_id), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+        }
+    }
+
+    // === Broadcast binary ops ================================================
+
+    pub fn broadcast_add(&self, rhs: &Tensor) -> Tensor {
+        broadcast_binary_op(self, rhs, |a, b| a + b,
+            |lhs_v, rhs_v, lhs_bi, rhs_bi, out_shape| {
+                BackwardOp::BroadcastAdd(BroadcastAddBackward {
+                    lhs_version: lhs_v, rhs_version: rhs_v,
+                    lhs_broadcast: lhs_bi, rhs_broadcast: rhs_bi,
+                    output_shape: out_shape,
+                })
+            })
+    }
+
+    pub fn broadcast_sub(&self, rhs: &Tensor) -> Tensor {
+        broadcast_binary_op(self, rhs, |a, b| a - b,
+            |lhs_v, rhs_v, lhs_bi, rhs_bi, out_shape| {
+                BackwardOp::BroadcastSub(BroadcastSubBackward {
+                    lhs_version: lhs_v, rhs_version: rhs_v,
+                    lhs_broadcast: lhs_bi, rhs_broadcast: rhs_bi,
+                    output_shape: out_shape,
+                })
+            })
+    }
+
+    pub fn broadcast_mul(&self, rhs: &Tensor) -> Tensor {
+        broadcast_binary_op(self, rhs, |a, b| a * b,
+            |lhs_v, rhs_v, lhs_bi, rhs_bi, out_shape| {
+                BackwardOp::BroadcastMul(BroadcastMulBackward {
+                    lhs_storage: StorageHandle::new(Vec::new()), // placeholder
+                    lhs_layout: Layout::contiguous(vec![]),
+                    lhs_version: lhs_v,
+                    rhs_storage: StorageHandle::new(Vec::new()),
+                    rhs_layout: Layout::contiguous(vec![]),
+                    rhs_version: rhs_v,
+                    lhs_broadcast: lhs_bi, rhs_broadcast: rhs_bi,
+                    output_shape: out_shape,
+                })
+            })
     }
 
     /// Flatten all dimensions after the first into a single dimension.

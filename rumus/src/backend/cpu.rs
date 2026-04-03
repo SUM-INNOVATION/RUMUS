@@ -232,6 +232,65 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn sigmoid(src: &[f32], dst: &mut [f32]) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = 1.0 / (1.0 + (-s).exp());
+        }
+    }
+
+    fn sigmoid_backward(saved_out: &[f32], out_grad: &[f32], dst: &mut [f32]) {
+        for i in 0..dst.len() {
+            let s = saved_out[i];
+            dst[i] = out_grad[i] * s * (1.0 - s);
+        }
+    }
+
+    fn tanh_act(src: &[f32], dst: &mut [f32]) {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = s.tanh();
+        }
+    }
+
+    fn tanh_backward(saved_out: &[f32], out_grad: &[f32], dst: &mut [f32]) {
+        for i in 0..dst.len() {
+            let t = saved_out[i];
+            dst[i] = out_grad[i] * (1.0 - t * t);
+        }
+    }
+
+    fn gelu(src: &[f32], dst: &mut [f32]) {
+        let c = (2.0f32 / std::f32::consts::PI).sqrt();
+        for (d, &x) in dst.iter_mut().zip(src) {
+            let inner = c * (x + 0.044715 * x * x * x);
+            *d = 0.5 * x * (1.0 + inner.tanh());
+        }
+    }
+
+    fn gelu_backward(saved_input: &[f32], out_grad: &[f32], dst: &mut [f32]) {
+        let c = (2.0f32 / std::f32::consts::PI).sqrt();
+        for i in 0..dst.len() {
+            let x = saved_input[i];
+            let inner = c * (x + 0.044715 * x * x * x);
+            let t = inner.tanh();
+            let sech2 = 1.0 - t * t;
+            let d_inner = c * (1.0 + 3.0 * 0.044715 * x * x);
+            let gelu_prime = 0.5 * (1.0 + t) + 0.5 * x * sech2 * d_inner;
+            dst[i] = out_grad[i] * gelu_prime;
+        }
+    }
+
+    fn leaky_relu(src: &[f32], dst: &mut [f32], alpha: f32) {
+        for (d, &x) in dst.iter_mut().zip(src) {
+            *d = if x > 0.0 { x } else { alpha * x };
+        }
+    }
+
+    fn leaky_relu_backward(saved_input: &[f32], out_grad: &[f32], dst: &mut [f32], alpha: f32) {
+        for i in 0..dst.len() {
+            dst[i] = out_grad[i] * if saved_input[i] > 0.0 { 1.0 } else { alpha };
+        }
+    }
+
     fn cross_entropy_forward(
         logits: &[f32], targets: &[f32],
         grad: &mut [f32], loss_per_b: &mut [f32],

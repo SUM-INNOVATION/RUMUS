@@ -141,6 +141,38 @@ struct ReduceParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct BroadcastBinaryParams {
+    pub numel: u32,
+    pub ndim: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub suffix_lo: [u32; 4],
+    pub suffix_hi: [u32; 4],
+    pub a_strides_lo: [u32; 4],
+    pub a_strides_hi: [u32; 4],
+    pub b_strides_lo: [u32; 4],
+    pub b_strides_hi: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct ReduceSumGpuParams {
+    pub out_numel: u32,
+    pub ndim: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub in_shape_lo: [u32; 4],
+    pub in_shape_hi: [u32; 4],
+    pub in_suffix_lo: [u32; 4],
+    pub in_suffix_hi: [u32; 4],
+    pub out_strides_lo: [u32; 4],
+    pub out_strides_hi: [u32; 4],
+    pub reduce_extents_lo: [u32; 4],
+    pub reduce_extents_hi: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct AdamWParams {
     lr: f32,
     beta1: f32,
@@ -161,6 +193,28 @@ struct BroadcastScaleParams {
     _pad2: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct FusedScaleParams {
+    pub numel: u32,
+    pub scalar: f32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub ndim: u32,
+    pub offset: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
+    pub shape_lo: [u32; 4],
+    pub shape_hi: [u32; 4],
+    pub strides_lo: [u32; 4],
+    pub strides_hi: [u32; 4],
+    pub suffix_lo: [u32; 4],
+    pub suffix_hi: [u32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<FusedScaleParams>() == 128);
+const _: () = assert!(std::mem::size_of::<BroadcastBinaryParams>() == 112);
+const _: () = assert!(std::mem::size_of::<ReduceSumGpuParams>() == 144);
 const _: () = assert!(std::mem::size_of::<BroadcastScaleParams>() == 16);
 const _: () = assert!(std::mem::size_of::<CrossEntropyParams>() == 16);
 const _: () = assert!(std::mem::size_of::<ReduceParams>() == 16);
@@ -949,6 +1003,67 @@ pub fn broadcast_scale(
     ctx.queue.submit(std::iter::once(encoder.finish()));
 }
 
+/// Fused stride-aware scale: reads from a non-contiguous source, multiplies
+/// by a scalar, writes to a dense output.  Zero intermediate VRAM allocation.
+pub(crate) fn fused_scale(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    dst: &wgpu::Buffer,
+    params: &FusedScaleParams,
+) {
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("fused_scale_params"),
+        contents: bytemuck::bytes_of(params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.fused_scale_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((params.numel + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// Build a `FusedScaleParams` from tensor metadata.
+pub(crate) fn make_fused_scale_params(
+    numel: usize, scalar: f32,
+    ndim: usize, offset: usize,
+    shape: &[usize], strides: &[usize], suffix: &[usize],
+) -> FusedScaleParams {
+    let mut p = FusedScaleParams {
+        numel: numel as u32, scalar,
+        _pad0: 0, _pad1: 0,
+        ndim: ndim as u32, offset: offset as u32,
+        _pad2: 0, _pad3: 0,
+        shape_lo: [0; 4], shape_hi: [0; 4],
+        strides_lo: [0; 4], strides_hi: [0; 4],
+        suffix_lo: [0; 4], suffix_hi: [0; 4],
+    };
+    for i in 0..ndim {
+        if i < 4 {
+            p.shape_lo[i] = shape[i] as u32;
+            p.strides_lo[i] = strides[i] as u32;
+            p.suffix_lo[i] = suffix[i] as u32;
+        } else {
+            p.shape_hi[i - 4] = shape[i] as u32;
+            p.strides_hi[i - 4] = strides[i] as u32;
+            p.suffix_hi[i - 4] = suffix[i] as u32;
+        }
+    }
+    p
+}
+
 pub fn cross_entropy_forward(
     ctx: &GpuContext,
     logits: &wgpu::Buffer,
@@ -1064,4 +1179,144 @@ pub fn adamw_step(
         pass.dispatch_workgroups((numel + 63) / 64, 1, 1);
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast binary ops (GPU dispatch)
+// ---------------------------------------------------------------------------
+
+fn dispatch_broadcast_binary(
+    ctx: &GpuContext,
+    pipeline: &wgpu::ComputePipeline,
+    a: &wgpu::Buffer, b: &wgpu::Buffer, dst: &wgpu::Buffer,
+    params: &BroadcastBinaryParams,
+) {
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("broadcast_params"),
+        contents: bytemuck::bytes_of(params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.binary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: dst.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((params.numel + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+pub(crate) fn broadcast_add_gpu(ctx: &GpuContext, a: &wgpu::Buffer, b: &wgpu::Buffer, dst: &wgpu::Buffer, params: &BroadcastBinaryParams) {
+    dispatch_broadcast_binary(ctx, &ctx.pipelines.broadcast_add_pipeline, a, b, dst, params);
+}
+pub(crate) fn broadcast_sub_gpu(ctx: &GpuContext, a: &wgpu::Buffer, b: &wgpu::Buffer, dst: &wgpu::Buffer, params: &BroadcastBinaryParams) {
+    dispatch_broadcast_binary(ctx, &ctx.pipelines.broadcast_sub_pipeline, a, b, dst, params);
+}
+pub(crate) fn broadcast_mul_gpu(ctx: &GpuContext, a: &wgpu::Buffer, b: &wgpu::Buffer, dst: &wgpu::Buffer, params: &BroadcastBinaryParams) {
+    dispatch_broadcast_binary(ctx, &ctx.pipelines.broadcast_mul_pipeline, a, b, dst, params);
+}
+
+pub(crate) fn make_broadcast_params(
+    numel: usize, ndim: usize,
+    suffix: &[usize], a_strides: &[usize], b_strides: &[usize],
+) -> BroadcastBinaryParams {
+    let mut p = BroadcastBinaryParams {
+        numel: numel as u32, ndim: ndim as u32, _pad0: 0, _pad1: 0,
+        suffix_lo: [0; 4], suffix_hi: [0; 4],
+        a_strides_lo: [0; 4], a_strides_hi: [0; 4],
+        b_strides_lo: [0; 4], b_strides_hi: [0; 4],
+    };
+    for i in 0..ndim {
+        if i < 4 {
+            p.suffix_lo[i] = suffix[i] as u32;
+            p.a_strides_lo[i] = a_strides[i] as u32;
+            p.b_strides_lo[i] = b_strides[i] as u32;
+        } else {
+            p.suffix_hi[i - 4] = suffix[i] as u32;
+            p.a_strides_hi[i - 4] = a_strides[i] as u32;
+            p.b_strides_hi[i - 4] = b_strides[i] as u32;
+        }
+    }
+    p
+}
+
+// ---------------------------------------------------------------------------
+// Reduce sum (broadcast backward, GPU)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn reduce_sum_gpu(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer, output: &wgpu::Buffer,
+    params: &ReduceSumGpuParams,
+) {
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("reduce_sum_params"),
+        contents: bytemuck::bytes_of(params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.reduce_sum_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((params.out_numel + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+pub(crate) fn make_reduce_sum_params(
+    input_shape: &[usize], reduced_dims: &[usize], out_numel: usize,
+) -> ReduceSumGpuParams {
+    let ndim = input_shape.len();
+    let suffix = crate::tensor::broadcast::suffix_products(input_shape);
+    let mut out_shape = input_shape.to_vec();
+    for &d in reduced_dims { out_shape[d] = 1; }
+    let mut out_strides = vec![0usize; ndim];
+    let mut s = 1usize;
+    for d in (0..ndim).rev() {
+        if reduced_dims.contains(&d) { out_strides[d] = 0; }
+        else { out_strides[d] = s; s *= out_shape[d]; }
+    }
+    let mut reduce_extents = vec![1usize; ndim];
+    for &d in reduced_dims { reduce_extents[d] = input_shape[d]; }
+
+    let mut p = ReduceSumGpuParams {
+        out_numel: out_numel as u32, ndim: ndim as u32, _pad0: 0, _pad1: 0,
+        in_shape_lo: [0;4], in_shape_hi: [0;4], in_suffix_lo: [0;4], in_suffix_hi: [0;4],
+        out_strides_lo: [0;4], out_strides_hi: [0;4],
+        reduce_extents_lo: [0;4], reduce_extents_hi: [0;4],
+    };
+    for i in 0..ndim {
+        if i < 4 {
+            p.in_shape_lo[i] = input_shape[i] as u32;
+            p.in_suffix_lo[i] = suffix[i] as u32;
+            p.out_strides_lo[i] = out_strides[i] as u32;
+            p.reduce_extents_lo[i] = reduce_extents[i] as u32;
+        } else {
+            p.in_shape_hi[i-4] = input_shape[i] as u32;
+            p.in_suffix_hi[i-4] = suffix[i] as u32;
+            p.out_strides_hi[i-4] = out_strides[i] as u32;
+            p.reduce_extents_hi[i-4] = reduce_extents[i] as u32;
+        }
+    }
+    p
 }

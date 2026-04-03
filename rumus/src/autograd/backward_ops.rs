@@ -254,6 +254,76 @@ pub struct DropoutBackward {
     pub mask_layout: Layout,
 }
 
+/// Backward for `sigmoid(input)`.  Saves **output**.
+/// `grad = out_grad * saved_out * (1 - saved_out)`
+#[derive(Debug)]
+pub struct SigmoidBackward {
+    pub output_storage: StorageHandle,
+    pub output_layout: Layout,
+    pub input_version: VersionSnapshot,
+}
+
+/// Backward for `tanh(input)`.  Saves **output**.
+/// `grad = out_grad * (1 - saved_out^2)`
+#[derive(Debug)]
+pub struct TanhBackward {
+    pub output_storage: StorageHandle,
+    pub output_layout: Layout,
+    pub input_version: VersionSnapshot,
+}
+
+/// Backward for `gelu(input)` (tanh approx).  Saves **input**.
+#[derive(Debug)]
+pub struct GeluBackward {
+    pub input_storage: StorageHandle,
+    pub input_layout: Layout,
+    pub input_version: VersionSnapshot,
+}
+
+/// Backward for `leaky_relu(input, alpha)`.  Saves **input**.
+#[derive(Debug)]
+pub struct LeakyReluBackward {
+    pub input_storage: StorageHandle,
+    pub input_layout: Layout,
+    pub input_version: VersionSnapshot,
+    pub alpha: f32,
+}
+
+/// Backward for a broadcasted binary op.
+///
+/// If an operand was broadcast, its gradient must be summed (reduced)
+/// along the broadcast dimensions.
+#[derive(Debug)]
+pub struct BroadcastAddBackward {
+    pub lhs_version: VersionSnapshot,
+    pub rhs_version: VersionSnapshot,
+    pub lhs_broadcast: Option<crate::tensor::broadcast::BroadcastInfo>,
+    pub rhs_broadcast: Option<crate::tensor::broadcast::BroadcastInfo>,
+    pub output_shape: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub struct BroadcastSubBackward {
+    pub lhs_version: VersionSnapshot,
+    pub rhs_version: VersionSnapshot,
+    pub lhs_broadcast: Option<crate::tensor::broadcast::BroadcastInfo>,
+    pub rhs_broadcast: Option<crate::tensor::broadcast::BroadcastInfo>,
+    pub output_shape: Vec<usize>,
+}
+
+#[derive(Debug)]
+pub struct BroadcastMulBackward {
+    pub lhs_storage: StorageHandle,
+    pub lhs_layout: Layout,
+    pub lhs_version: VersionSnapshot,
+    pub rhs_storage: StorageHandle,
+    pub rhs_layout: Layout,
+    pub rhs_version: VersionSnapshot,
+    pub lhs_broadcast: Option<crate::tensor::broadcast::BroadcastInfo>,
+    pub rhs_broadcast: Option<crate::tensor::broadcast::BroadcastInfo>,
+    pub output_shape: Vec<usize>,
+}
+
 // ---------------------------------------------------------------------------
 // BackwardOp enum
 // ---------------------------------------------------------------------------
@@ -279,6 +349,13 @@ pub enum BackwardOp {
     Reshape(ReshapeBackward),
     Dropout(DropoutBackward),
     CrossEntropy(CrossEntropyBackward),
+    Sigmoid(SigmoidBackward),
+    Tanh(TanhBackward),
+    Gelu(GeluBackward),
+    LeakyRelu(LeakyReluBackward),
+    BroadcastAdd(BroadcastAddBackward),
+    BroadcastSub(BroadcastSubBackward),
+    BroadcastMul(BroadcastMulBackward),
 }
 
 const _: () = {
