@@ -291,6 +291,79 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn layer_norm_forward(
+        input: &[f32], weight: &[f32], bias: &[f32],
+        output: &mut [f32], save: &mut [f32],
+        num_instances: usize, norm_size: usize, epsilon: f32,
+    ) {
+        let d = norm_size;
+        for i in 0..num_instances {
+            let base = i * d;
+            let row = &input[base..base + d];
+            let mean: f32 = row.iter().sum::<f32>() / d as f32;
+            let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / d as f32;
+            let invstd = 1.0 / (var + epsilon).sqrt();
+            save[i * 2] = mean;
+            save[i * 2 + 1] = invstd;
+            for j in 0..d {
+                let x_hat = (input[base + j] - mean) * invstd;
+                output[base + j] = weight[j] * x_hat + bias[j];
+            }
+        }
+    }
+
+    fn layer_norm_backward(
+        grad_out: &[f32], input: &[f32], weight: &[f32],
+        save: &[f32], grad_input: &mut [f32],
+        num_instances: usize, norm_size: usize,
+    ) {
+        let d = norm_size;
+        for i in 0..num_instances {
+            let base = i * d;
+            let mean = save[i * 2];
+            let invstd = save[i * 2 + 1];
+            let mut c1 = 0.0f32;
+            let mut c2 = 0.0f32;
+            for j in 0..d {
+                let grad_norm_j = grad_out[base + j] * weight[j];
+                let x_hat_j = (input[base + j] - mean) * invstd;
+                c1 += grad_norm_j;
+                c2 += grad_norm_j * x_hat_j;
+            }
+            c1 /= d as f32;
+            c2 /= d as f32;
+            for j in 0..d {
+                let grad_norm_j = grad_out[base + j] * weight[j];
+                let x_hat_j = (input[base + j] - mean) * invstd;
+                grad_input[base + j] = invstd * (grad_norm_j - c1 - x_hat_j * c2);
+            }
+        }
+    }
+
+    fn embedding_forward(
+        indices: &[f32], weight: &[f32], output: &mut [f32],
+        total_lookups: usize, embed_dim: usize,
+    ) {
+        for i in 0..total_lookups {
+            let token_id = indices[i] as usize;
+            for d in 0..embed_dim {
+                output[i * embed_dim + d] = weight[token_id * embed_dim + d];
+            }
+        }
+    }
+
+    fn embedding_backward(
+        grad_out: &[f32], indices: &[f32], grad_weight: &mut [f32],
+        total_lookups: usize, embed_dim: usize,
+    ) {
+        for i in 0..total_lookups {
+            let token_id = indices[i] as usize;
+            for d in 0..embed_dim {
+                grad_weight[token_id * embed_dim + d] += grad_out[i * embed_dim + d];
+            }
+        }
+    }
+
     fn cross_entropy_forward(
         logits: &[f32], targets: &[f32],
         grad: &mut [f32], loss_per_b: &mut [f32],

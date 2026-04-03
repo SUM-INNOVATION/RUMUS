@@ -143,6 +143,32 @@ pub trait Backend {
     fn leaky_relu(src: &[f32], dst: &mut [f32], alpha: f32);
     fn leaky_relu_backward(saved_input: &[f32], out_grad: &[f32], dst: &mut [f32], alpha: f32);
 
+    // ----- LayerNorm -----------------------------------------------------------
+
+    fn layer_norm_forward(
+        input: &[f32], weight: &[f32], bias: &[f32],
+        output: &mut [f32], save_mean_invstd: &mut [f32],
+        num_instances: usize, norm_size: usize, epsilon: f32,
+    );
+
+    fn layer_norm_backward(
+        grad_out: &[f32], input: &[f32], weight: &[f32],
+        save_mean_invstd: &[f32], grad_input: &mut [f32],
+        num_instances: usize, norm_size: usize,
+    );
+
+    // ----- Embedding -----------------------------------------------------------
+
+    fn embedding_forward(
+        indices: &[f32], weight: &[f32], output: &mut [f32],
+        total_lookups: usize, embed_dim: usize,
+    );
+
+    fn embedding_backward(
+        grad_out: &[f32], indices: &[f32], grad_weight: &mut [f32],
+        total_lookups: usize, embed_dim: usize,
+    );
+
     // ----- Loss ----------------------------------------------------------------
 
     /// Cross-entropy loss forward: computes per-batch loss AND gradient in one pass.

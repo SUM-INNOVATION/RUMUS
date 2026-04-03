@@ -54,6 +54,16 @@ pub struct PipelineCache {
     pub broadcast_mul_pipeline: wgpu::ComputePipeline,
     pub reduce_sum_pipeline: wgpu::ComputePipeline,
 
+    // LayerNorm (6-binding layout: input + weight + bias + output + save + uniform)
+    pub ln_layout: wgpu::BindGroupLayout,
+    pub ln_forward_pipeline: wgpu::ComputePipeline,
+    pub ln_bw_layout: wgpu::BindGroupLayout,
+    pub ln_backward_pipeline: wgpu::ComputePipeline,
+    pub ln_grad_weight_pipeline: wgpu::ComputePipeline,
+
+    // Embedding (reuses binary_layout)
+    pub embedding_pipeline: wgpu::ComputePipeline,
+
     // Fused stride-aware scale (for negate, etc.)
     pub fused_scale_pipeline: wgpu::ComputePipeline,
 
@@ -198,6 +208,24 @@ impl PipelineCache {
             ),
         });
 
+        let ln_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("layer_norm"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/layer_norm.wgsl").into()),
+        });
+        let ln_bw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("layer_norm_bw"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/layer_norm_bw.wgsl").into()),
+        });
+        let ln_gw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("layer_norm_grad_weight"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/layer_norm_grad_weight.wgsl").into()),
+        });
+
+        let embedding_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("embedding"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/embedding.wgsl").into()),
+        });
+
         let fused_scale_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fused_scale"),
             source: wgpu::ShaderSource::Wgsl(
@@ -277,6 +305,32 @@ impl PipelineCache {
             ],
         });
 
+        // LayerNorm forward: input(read) + weight(read) + bias(read) + output(rw) + save(rw) + uniform
+        let ln_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ln_layout"),
+            entries: &[
+                bgl_storage(0, true),  // input
+                bgl_storage(1, true),  // weight
+                bgl_storage(2, true),  // bias
+                bgl_storage_rw(3),     // output
+                bgl_storage_rw(4),     // save (mean+invstd)
+                bgl_uniform(5),
+            ],
+        });
+
+        // LayerNorm backward: grad_out(read) + input(read) + weight(read) + save(read) + grad_in(rw) + uniform
+        let ln_bw_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ln_bw_layout"),
+            entries: &[
+                bgl_storage(0, true),  // grad_out
+                bgl_storage(1, true),  // input
+                bgl_storage(2, true),  // weight
+                bgl_storage(3, true),  // save
+                bgl_storage_rw(4),     // grad_in
+                bgl_uniform(5),
+            ],
+        });
+
         // Cross-entropy: logits(read) + targets(read) + grad(rw) + loss_per_b(rw) + uniform
         let ce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ce_layout"),
@@ -338,6 +392,11 @@ impl PipelineCache {
         let broadcast_mul_pipeline = make_pipeline(&binary_layout, &broadcast_module, "broadcast_mul_kernel", "bc_mul");
         let reduce_sum_pipeline = make_pipeline(&unary_layout, &broadcast_module, "reduce_sum_kernel", "reduce_sum");
 
+        let ln_forward_pipeline = make_pipeline(&ln_layout, &ln_module, "layer_norm_forward_kernel", "ln_fwd");
+        let ln_backward_pipeline = make_pipeline(&ln_bw_layout, &ln_bw_module, "layer_norm_backward_kernel", "ln_bw");
+        let ln_grad_weight_pipeline = make_pipeline(&ln_bw_layout, &ln_gw_module, "layer_norm_grad_weight_kernel", "ln_gw");
+        let embedding_pipeline = make_pipeline(&binary_layout, &embedding_module, "embedding_kernel", "embedding");
+
         let fused_scale_pipeline = make_pipeline(&unary_layout, &fused_scale_module, "fused_scale_kernel", "fused_scale");
 
         let broadcast_scale_pipeline = make_pipeline(&binary_layout, &broadcast_scale_module, "broadcast_scale_kernel", "broadcast_scale");
@@ -360,6 +419,9 @@ impl PipelineCache {
             ce_layout, ce_forward_pipeline, ce_reduce_pipeline,
             broadcast_add_pipeline, broadcast_sub_pipeline, broadcast_mul_pipeline,
             reduce_sum_pipeline,
+            ln_layout, ln_forward_pipeline,
+            ln_bw_layout, ln_backward_pipeline, ln_grad_weight_pipeline,
+            embedding_pipeline,
             fused_scale_pipeline,
             broadcast_scale_pipeline,
             contiguous_copy_pipeline,

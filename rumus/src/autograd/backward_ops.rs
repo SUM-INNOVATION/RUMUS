@@ -254,6 +254,38 @@ pub struct DropoutBackward {
     pub mask_layout: Layout,
 }
 
+/// Backward for `layer_norm`.
+///
+/// Kernel 1: per-instance grad_input via c1/c2 reductions.
+/// Kernel 2: grad_weight = reduce(grad_out * x_hat), grad_bias = reduce(grad_out).
+#[derive(Debug)]
+pub struct LayerNormBackward {
+    pub input_storage: StorageHandle,
+    pub input_layout: Layout,
+    pub input_version: VersionSnapshot,
+    pub weight_storage: StorageHandle,
+    pub weight_layout: Layout,
+    pub weight_version: VersionSnapshot,
+    pub save_storage: StorageHandle,  // [num_instances, 2]: mean + invstd
+    pub save_layout: Layout,
+    pub num_instances: usize,
+    pub norm_size: usize,
+}
+
+/// Backward for `embedding(indices)`.
+///
+/// Sparse scatter: grad_weight[token_id] += grad_output[lookup].
+/// CPU-only backward (no f32 atomics in WGSL).
+#[derive(Debug)]
+pub struct EmbeddingBackward {
+    pub input_version: VersionSnapshot,
+    pub indices_storage: StorageHandle,
+    pub indices_layout: Layout,
+    pub vocab_size: usize,
+    pub embed_dim: usize,
+    pub total_lookups: usize,
+}
+
 /// Backward for `sigmoid(input)`.  Saves **output**.
 /// `grad = out_grad * saved_out * (1 - saved_out)`
 #[derive(Debug)]
@@ -353,6 +385,8 @@ pub enum BackwardOp {
     Tanh(TanhBackward),
     Gelu(GeluBackward),
     LeakyRelu(LeakyReluBackward),
+    LayerNorm(LayerNormBackward),
+    Embedding(EmbeddingBackward),
     BroadcastAdd(BroadcastAddBackward),
     BroadcastSub(BroadcastSubBackward),
     BroadcastMul(BroadcastMulBackward),

@@ -12,9 +12,10 @@ use crate::autograd::context;
 use crate::autograd::{
     AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, BroadcastAddBackward,
     BroadcastMulBackward, BroadcastSubBackward, CrossEntropyBackward, DropoutBackward,
-    FlattenBackward, GeluBackward, Im2ColBackward, LeakyReluBackward, MatmulBackward,
-    MaxPool2dBackward, MseLossBackward, MulBackward, ReluBackward, ReshapeBackward,
-    SigmoidBackward, StackBackward, SubBackward, TanhBackward, TapeEntry, VersionSnapshot,
+    EmbeddingBackward, FlattenBackward, GeluBackward, Im2ColBackward, LayerNormBackward,
+    LeakyReluBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward, MulBackward,
+    ReluBackward, ReshapeBackward, SigmoidBackward, StackBackward, SubBackward, TanhBackward,
+    TapeEntry, VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
 #[cfg(feature = "gpu")]
@@ -1361,6 +1362,178 @@ impl Tensor {
             }
         } else {
             Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+        }
+    }
+
+    // === LayerNorm ===========================================================
+
+    /// Layer normalization over the last dimension.
+    ///
+    /// Input: `[..., D]`.  `weight` (γ) and `bias` (β) are `[D]`.
+    /// Saves mean+invstd per instance for backward.
+    /// Tape records 3 inputs: [input, weight, bias].
+    pub fn layer_norm(&self, weight: &Tensor, bias: &Tensor, epsilon: f32) -> Tensor {
+        let shape = self.shape().to_vec();
+        let norm_size = *shape.last().expect("layer_norm: empty shape");
+        let num_instances = self.numel() / norm_size;
+        assert_eq!(weight.shape(), &[norm_size], "layer_norm: weight shape mismatch");
+        assert_eq!(bias.shape(), &[norm_size], "layer_norm: bias shape mismatch");
+
+        // GPU path
+        #[cfg(feature = "gpu")]
+        let (out_storage, save_storage) = if self.storage.is_gpu() {
+            let ctx = GpuContext::get().expect("GPU required");
+            let ic = self.contiguous();
+            let wc = weight.contiguous();
+            let bc = bias.contiguous();
+            let ib = ic.storage.gpu_buffer();
+            let wb = wc.storage.gpu_buffer();
+            let bb = bc.storage.gpu_buffer();
+            let out_buf = ctx.pool.acquire(&ctx.device, (self.numel() * 4) as u64, STORAGE_USAGE);
+            let save_buf = ctx.pool.acquire(&ctx.device, (num_instances * 2 * 4) as u64, STORAGE_USAGE);
+            gpu_compute::layer_norm_forward(
+                ctx, &ib, &wb, &bb, &out_buf, &save_buf,
+                num_instances as u32, norm_size as u32, epsilon,
+            );
+            drop(ib); drop(wb); drop(bb);
+            (StorageHandle::new_gpu(out_buf, self.numel()),
+             StorageHandle::new_gpu(save_buf, num_instances * 2))
+        } else {
+            let ic = self.contiguous();
+            let wc = weight.contiguous();
+            let bc = bias.contiguous();
+            let ig = ic.storage.data();
+            let wg = wc.storage.data();
+            let bg = bc.storage.data();
+            let mut out = CpuBackend::zeros(self.numel());
+            let mut save = CpuBackend::zeros(num_instances * 2);
+            CpuBackend::layer_norm_forward(&ig, &wg, &bg, &mut out, &mut save, num_instances, norm_size, epsilon);
+            drop(ig); drop(wg); drop(bg);
+            (StorageHandle::new(out), StorageHandle::new(save))
+        };
+
+        #[cfg(not(feature = "gpu"))]
+        let (out_storage, save_storage) = {
+            let ic = self.contiguous();
+            let wc = weight.contiguous();
+            let bc = bias.contiguous();
+            let ig = ic.storage.data();
+            let wg = wc.storage.data();
+            let bg = bc.storage.data();
+            let mut out = CpuBackend::zeros(self.numel());
+            let mut save = CpuBackend::zeros(num_instances * 2);
+            CpuBackend::layer_norm_forward(&ig, &wg, &bg, &mut out, &mut save, num_instances, norm_size, epsilon);
+            drop(ig); drop(wg); drop(bg);
+            (StorageHandle::new(out), StorageHandle::new(save))
+        };
+
+        let any_tracked = (self.requires_grad() || weight.requires_grad() || bias.requires_grad())
+            && !context::is_no_grad();
+
+        if any_tracked {
+            let out_gid = context::next_grad_id();
+            let in_gid = require_grad_id(self).unwrap_or_else(context::next_grad_id);
+            let w_gid = require_grad_id(weight).unwrap_or_else(context::next_grad_id);
+            let b_gid = require_grad_id(bias).unwrap_or_else(context::next_grad_id);
+
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+            if let Some(m) = weight.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+            if let Some(m) = bias.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+            let weight_version = VersionSnapshot::new(w_gid, &weight.storage);
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::LayerNorm(LayerNormBackward {
+                        input_storage: self.storage.clone(),
+                        input_layout: self.layout.clone(),
+                        input_version,
+                        weight_storage: weight.storage.clone(),
+                        weight_layout: Layout::contiguous(vec![norm_size]),
+                        weight_version,
+                        save_storage: save_storage.clone(),
+                        save_layout: Layout::contiguous(vec![num_instances, 2]),
+                        num_instances,
+                        norm_size,
+                    }),
+                    inputs: vec![in_gid, w_gid, b_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(shape), state: AutogradState::None }
+        }
+    }
+
+    // === Embedding ============================================================
+
+    /// Embedding lookup: indices `[..., S]` → output `[..., S, embed_dim]`.
+    ///
+    /// `weight` shape: `[vocab_size, embed_dim]`.
+    /// `indices` stored as f32 (cast to u32 internally).
+    pub fn embedding_forward(&self, weight: &Tensor) -> Tensor {
+        let total_lookups = self.numel();
+        assert_eq!(weight.ndim(), 2, "embedding: weight must be 2-D [vocab, dim]");
+        let vocab_size = weight.shape()[0];
+        let embed_dim = weight.shape()[1];
+
+        let ic = self.contiguous();
+        let wc = weight.contiguous();
+        let ig = ic.storage.data();
+        let wg = wc.storage.data();
+        let mut out = CpuBackend::zeros(total_lookups * embed_dim);
+        CpuBackend::embedding_forward(&ig, &wg, &mut out, total_lookups, embed_dim);
+        drop(ig); drop(wg);
+
+        let mut out_shape = self.shape().to_vec();
+        out_shape.push(embed_dim);
+        let out_storage = StorageHandle::new(out);
+
+        if weight.requires_grad() && !context::is_no_grad() {
+            let out_gid = context::next_grad_id();
+            let w_gid = require_grad_id(weight).unwrap_or_else(context::next_grad_id);
+
+            if let Some(m) = weight.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+            let input_version = VersionSnapshot::new(
+                context::next_grad_id(), &self.storage,
+            );
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Embedding(EmbeddingBackward {
+                        input_version,
+                        indices_storage: self.storage.clone(),
+                        indices_layout: self.layout.clone(),
+                        vocab_size,
+                        embed_dim,
+                        total_lookups,
+                    }),
+                    inputs: vec![w_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(out_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(out_shape), state: AutogradState::None }
         }
     }
 

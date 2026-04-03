@@ -212,6 +212,36 @@ pub(crate) struct FusedScaleParams {
     pub suffix_hi: [u32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct LayerNormParams {
+    pub num_instances: u32,
+    pub norm_size: u32,
+    pub epsilon: f32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct LayerNormBwParams {
+    pub num_instances: u32,
+    pub norm_size: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct EmbeddingParams {
+    pub total_lookups: u32,
+    pub embed_dim: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<LayerNormParams>() == 16);
+const _: () = assert!(std::mem::size_of::<LayerNormBwParams>() == 16);
+const _: () = assert!(std::mem::size_of::<EmbeddingParams>() == 16);
 const _: () = assert!(std::mem::size_of::<FusedScaleParams>() == 128);
 const _: () = assert!(std::mem::size_of::<BroadcastBinaryParams>() == 112);
 const _: () = assert!(std::mem::size_of::<ReduceSumGpuParams>() == 144);
@@ -1319,4 +1349,144 @@ pub(crate) fn make_reduce_sum_params(
         }
     }
     p
+}
+
+// ---------------------------------------------------------------------------
+// LayerNorm
+// ---------------------------------------------------------------------------
+
+pub(crate) fn layer_norm_forward(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer, weight: &wgpu::Buffer, bias: &wgpu::Buffer,
+    output: &wgpu::Buffer, save: &wgpu::Buffer,
+    num_instances: u32, norm_size: u32, epsilon: f32,
+) {
+    let params = LayerNormParams { num_instances, norm_size, epsilon, _pad: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("ln_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.ln_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: weight.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: bias.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: save.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.ln_forward_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(num_instances, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// Compute grad_out * x_hat element-wise on GPU (for grad_weight reduction).
+pub(crate) fn layer_norm_grad_weight_product(
+    ctx: &GpuContext,
+    grad_out: &wgpu::Buffer, input: &wgpu::Buffer, weight_placeholder: &wgpu::Buffer,
+    save: &wgpu::Buffer, output: &wgpu::Buffer,
+    num_instances: u32, norm_size: u32,
+) {
+    let params = LayerNormBwParams { num_instances, norm_size, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("ln_gw_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.ln_bw_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: grad_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: weight_placeholder.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: save.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let total = num_instances * norm_size;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.ln_grad_weight_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+pub(crate) fn layer_norm_backward(
+    ctx: &GpuContext,
+    grad_out: &wgpu::Buffer, input: &wgpu::Buffer, weight: &wgpu::Buffer,
+    save: &wgpu::Buffer, grad_in: &wgpu::Buffer,
+    num_instances: u32, norm_size: u32,
+) {
+    let params = LayerNormBwParams { num_instances, norm_size, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("lnbw_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.ln_bw_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: grad_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: weight.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: save.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: grad_in.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.ln_backward_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(num_instances, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// Embedding
+// ---------------------------------------------------------------------------
+
+pub(crate) fn embedding_forward(
+    ctx: &GpuContext,
+    indices: &wgpu::Buffer, weight: &wgpu::Buffer, output: &wgpu::Buffer,
+    total_lookups: u32, embed_dim: u32,
+) {
+    let params = EmbeddingParams { total_lookups, embed_dim, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("emb_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.binary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: weight.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let total = total_lookups * embed_dim;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.embedding_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
 }
