@@ -61,6 +61,15 @@ pub struct PipelineCache {
     pub ln_backward_pipeline: wgpu::ComputePipeline,
     pub ln_grad_weight_pipeline: wgpu::ComputePipeline,
 
+    // BatchNorm2d (8-binding layout)
+    pub bn_layout: wgpu::BindGroupLayout,
+    pub bn_forward_pipeline: wgpu::ComputePipeline,
+    pub bn_backward_pipeline: wgpu::ComputePipeline,
+
+    // AdaptiveAvgPool2d (reuses unary_layout)
+    pub adaptive_pool_fwd_pipeline: wgpu::ComputePipeline,
+    pub adaptive_pool_bw_pipeline: wgpu::ComputePipeline,
+
     // Bmm (reuses matmul_layout)
     pub bmm_pipeline: wgpu::ComputePipeline,
 
@@ -215,6 +224,19 @@ impl PipelineCache {
             ),
         });
 
+        let bn_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("batch_norm"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/batch_norm.wgsl").into()),
+        });
+        let bn_bw_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("batch_norm_bw"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/batch_norm_bw.wgsl").into()),
+        });
+        let ap_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("adaptive_pool"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/adaptive_pool.wgsl").into()),
+        });
+
         let bmm_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bmm"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/bmm.wgsl").into()),
@@ -351,6 +373,21 @@ impl PipelineCache {
             ],
         });
 
+        // BatchNorm2d: 8 bindings
+        let bn_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bn_layout"),
+            entries: &[
+                bgl_storage(0, true),  // input
+                bgl_storage(1, true),  // weight
+                bgl_storage(2, true),  // bias
+                bgl_storage_rw(3),     // running_mean
+                bgl_storage_rw(4),     // running_var
+                bgl_storage_rw(5),     // output
+                bgl_storage_rw(6),     // save
+                bgl_uniform(7),
+            ],
+        });
+
         // Cross-entropy: logits(read) + targets(read) + grad(rw) + loss_per_b(rw) + uniform
         let ce_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ce_layout"),
@@ -412,6 +449,11 @@ impl PipelineCache {
         let broadcast_mul_pipeline = make_pipeline(&binary_layout, &broadcast_module, "broadcast_mul_kernel", "bc_mul");
         let reduce_sum_pipeline = make_pipeline(&unary_layout, &broadcast_module, "reduce_sum_kernel", "reduce_sum");
 
+        let bn_forward_pipeline = make_pipeline(&bn_layout, &bn_module, "batch_norm_forward_kernel", "bn_fwd");
+        let bn_backward_pipeline = make_pipeline(&ln_bw_layout, &bn_bw_module, "batch_norm_backward_kernel", "bn_bw");
+        let adaptive_pool_fwd_pipeline = make_pipeline(&unary_layout, &ap_module, "adaptive_avg_pool2d_kernel", "ap_fwd");
+        let adaptive_pool_bw_pipeline = make_pipeline(&unary_layout, &ap_module, "adaptive_avg_pool2d_backward_kernel", "ap_bw");
+
         let bmm_pipeline = make_pipeline(&matmul_layout, &bmm_module, "bmm_kernel", "bmm");
         let softmax_forward_pipeline = make_pipeline(&unary_layout, &softmax_module, "softmax_forward_kernel", "sm_fwd");
         let softmax_backward_pipeline = make_pipeline(&binary_layout, &softmax_bw_module, "softmax_backward_kernel", "sm_bw");
@@ -443,6 +485,8 @@ impl PipelineCache {
             ce_layout, ce_forward_pipeline, ce_reduce_pipeline,
             broadcast_add_pipeline, broadcast_sub_pipeline, broadcast_mul_pipeline,
             reduce_sum_pipeline,
+            bn_layout, bn_forward_pipeline, bn_backward_pipeline,
+            adaptive_pool_fwd_pipeline, adaptive_pool_bw_pipeline,
             bmm_pipeline,
             softmax_forward_pipeline, softmax_backward_pipeline,
             ln_layout, ln_forward_pipeline,

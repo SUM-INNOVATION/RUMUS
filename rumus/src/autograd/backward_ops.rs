@@ -392,6 +392,41 @@ pub struct BroadcastMulBackward {
     pub output_shape: Vec<usize>,
 }
 
+/// Backward for `batch_norm_2d(input, weight, bias)`.
+///
+/// Saves input, weight, and mean+invstd for backward.
+/// Tape records 3 inputs: [input, weight, bias].
+#[derive(Debug)]
+pub struct BatchNorm2dBackward {
+    pub input_storage: StorageHandle,
+    pub input_layout: Layout,
+    pub input_version: VersionSnapshot,
+    pub weight_storage: StorageHandle,
+    pub weight_layout: Layout,
+    pub weight_version: VersionSnapshot,
+    pub save_storage: StorageHandle,  // [channels, 2]: mean + invstd per channel
+    pub save_layout: Layout,
+    pub batch: usize,
+    pub channels: usize,
+    pub height: usize,
+    pub width: usize,
+}
+
+/// Backward for `adaptive_avg_pool2d(input)`.
+///
+/// Each input pixel distributes its gradient to the output bins that cover it,
+/// weighted by `1/count`.
+#[derive(Debug)]
+pub struct AdaptiveAvgPool2dBackward {
+    pub input_version: VersionSnapshot,
+    pub batch: usize,
+    pub channels: usize,
+    pub h_in: usize,
+    pub w_in: usize,
+    pub h_out: usize,
+    pub w_out: usize,
+}
+
 // ---------------------------------------------------------------------------
 // BackwardOp enum
 // ---------------------------------------------------------------------------
@@ -429,6 +464,8 @@ pub enum BackwardOp {
     BroadcastAdd(BroadcastAddBackward),
     BroadcastSub(BroadcastSubBackward),
     BroadcastMul(BroadcastMulBackward),
+    BatchNorm2d(BatchNorm2dBackward),
+    AdaptiveAvgPool2d(AdaptiveAvgPool2dBackward),
 }
 
 const _: () = {

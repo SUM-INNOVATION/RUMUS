@@ -6,10 +6,10 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 
 | Module | Description |
 |--------|-------------|
-| `tensor` | `StorageHandle` (CPU `Vec` or GPU `wgpu::Buffer` via `parking_lot::RwLock<StorageData>`), `Layout`, `AutogradState`, and all tensor operations (`add`, `mul`, `matmul`, `relu`, `dropout`, `im2col`, `flatten`, `max_pool2d`, `cross_entropy_loss`, etc.) |
-| `autograd` | Thread-local `Tape`, `GradientStore`, Kahn's algorithm backward engine, `no_grad()` RAII guard, `VersionSnapshot` with `Weak` references |
-| `backend` | `Backend` trait (CPU) + feature-gated `gpu` module: `GpuContext` singleton, `BufferPool`, `PipelineCache` (25 WGSL compute pipelines), and all GPU dispatch functions |
-| `nn` | `Parameter`, `Module` trait, `#[derive(Module)]` (re-exported from `rumus-macros`), `Linear`, `Conv2d`, `MaxPool2d`, `Flatten`, `Dropout`, `mse_loss`, `cross_entropy_loss`, safetensors IO |
+| `tensor` | `StorageHandle` (CPU `Vec` or GPU `wgpu::Buffer` via `parking_lot::RwLock<StorageData>`), `Layout`, `AutogradState`, N-dimensional broadcasting, and all tensor operations (`add`, `mul`, `matmul`, `relu`, `sigmoid`, `tanh`, `gelu`, `leaky_relu`, `dropout`, `im2col`, `flatten`, `max_pool2d`, `batch_norm_2d`, `adaptive_avg_pool2d`, `bmm`, `softmax`, `layer_norm`, `embedding_forward`, `cross_entropy_loss`, `broadcast_add/sub/mul`, etc.) |
+| `autograd` | Thread-local `Tape`, `GradientStore`, Kahn's algorithm backward engine, `no_grad()` RAII guard, `VersionSnapshot` with `Weak` references, 30 concrete `BackwardOp` variants |
+| `backend` | `Backend` trait (CPU) + feature-gated `gpu` module: `GpuContext` singleton, `BufferPool`, `PipelineCache` (35+ WGSL compute pipelines), and all GPU dispatch functions |
+| `nn` | `Parameter`, `Module` trait, `#[derive(Module)]` (re-exported from `rumus-macros`), `Linear`, `Conv2d`, `ConvTranspose2d`, `MaxPool2d`, `AdaptiveAvgPool2d`, `Flatten`, `Dropout`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `MultiheadAttention`, `TransformerBlock`, activations (`relu`, `sigmoid`, `tanh`, `gelu`, `leaky_relu`), `mse_loss`, `cross_entropy_loss`, safetensors IO |
 | `optim` | `Optimizer` trait, `SGD`, `Adam`, `AdamW` — all with CPU + GPU dual-path dispatch |
 | `train` | `Trainer<O: Optimizer>` — closure-based `train_step()` orchestrator |
 

@@ -143,6 +143,34 @@ pub trait Backend {
     fn leaky_relu(src: &[f32], dst: &mut [f32], alpha: f32);
     fn leaky_relu_backward(saved_input: &[f32], out_grad: &[f32], dst: &mut [f32], alpha: f32);
 
+    // ----- BatchNorm2d ---------------------------------------------------------
+
+    fn batch_norm_forward(
+        input: &[f32], weight: &[f32], bias: &[f32],
+        running_mean: &mut [f32], running_var: &mut [f32],
+        output: &mut [f32], save: &mut [f32],
+        batch: usize, channels: usize, height: usize, width: usize,
+        epsilon: f32, momentum: f32, is_training: bool,
+    );
+
+    fn batch_norm_backward(
+        grad_out: &[f32], input: &[f32], weight: &[f32], save: &[f32],
+        grad_input: &mut [f32],
+        batch: usize, channels: usize, height: usize, width: usize,
+    );
+
+    // ----- AdaptiveAvgPool2d ---------------------------------------------------
+
+    fn adaptive_avg_pool2d(
+        input: &[f32], output: &mut [f32],
+        batch: usize, channels: usize, h_in: usize, w_in: usize, h_out: usize, w_out: usize,
+    );
+
+    fn adaptive_avg_pool2d_backward(
+        grad_out: &[f32], grad_in: &mut [f32],
+        batch: usize, channels: usize, h_in: usize, w_in: usize, h_out: usize, w_out: usize,
+    );
+
     // ----- Batched MatMul ------------------------------------------------------
 
     fn bmm(a: &[f32], b: &[f32], dst: &mut [f32], batch: usize, m: usize, k: usize, n: usize);

@@ -785,6 +785,194 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 grads.accumulate(entry.inputs[0], grad_lhs)?;
                 grads.accumulate(entry.inputs[1], grad_rhs)?;
             }
+
+            BackwardOp::BatchNorm2d(bw) => {
+                bw.input_version.check()?;
+                bw.weight_version.check()?;
+                let (b, c, h, w) = (bw.batch, bw.channels, bw.height, bw.width);
+
+                let saved_input = Tensor::from_storage_and_layout(bw.input_storage.clone(), bw.input_layout.clone());
+                let saved_weight = Tensor::from_storage_and_layout(bw.weight_storage.clone(), bw.weight_layout.clone());
+                let saved_save = Tensor::from_storage_and_layout(bw.save_storage.clone(), bw.save_layout.clone());
+
+                #[cfg(feature = "gpu")]
+                if out_grad.storage.is_gpu() {
+                    use crate::backend::gpu::{
+                        compute as gpu_compute,
+                        context::{GpuContext, STORAGE_USAGE},
+                    };
+                    let ctx = GpuContext::get().expect("GPU required");
+
+                    let og_c = out_grad.contiguous();
+                    let in_c = saved_input.contiguous();
+                    let wt_c = saved_weight.contiguous();
+                    let sv_c = saved_save.contiguous();
+                    let og_buf = og_c.storage.gpu_buffer();
+                    let in_buf = in_c.storage.gpu_buffer();
+                    let wt_buf = wt_c.storage.gpu_buffer();
+                    let sv_buf = sv_c.storage.gpu_buffer();
+
+                    let gi_buf = ctx.pool.acquire(&ctx.device, (b * c * h * w * 4) as u64, STORAGE_USAGE);
+                    gpu_compute::batch_norm_backward(
+                        ctx, &og_buf, &in_buf, &wt_buf, &sv_buf, &gi_buf,
+                        b as u32, c as u32, h as u32, w as u32,
+                    );
+
+                    // grad_weight/grad_bias: CPU reduction (D2H via .data()).
+                    let og_cpu = og_c.storage.data();
+                    let in_cpu = in_c.storage.data();
+                    let sv_cpu = sv_c.storage.data();
+                    let spatial = h * w;
+                    let mut gw = CpuBackend::zeros(c);
+                    let mut gb = CpuBackend::zeros(c);
+                    for ch in 0..c {
+                        let mean = sv_cpu[ch * 2];
+                        let invstd = sv_cpu[ch * 2 + 1];
+                        for bi in 0..b {
+                            for s in 0..spatial {
+                                let idx = bi * c * spatial + ch * spatial + s;
+                                let x_hat = (in_cpu[idx] - mean) * invstd;
+                                gw[ch] += og_cpu[idx] * x_hat;
+                                gb[ch] += og_cpu[idx];
+                            }
+                        }
+                    }
+                    drop(og_buf); drop(in_buf); drop(wt_buf); drop(sv_buf);
+                    drop(og_cpu); drop(in_cpu); drop(sv_cpu);
+
+                    let gi_t = Tensor::from_storage_and_layout(
+                        crate::tensor::StorageHandle::new_gpu(gi_buf, b * c * h * w),
+                        crate::tensor::Layout::contiguous(vec![b, c, h, w]),
+                    );
+                    grads.accumulate(entry.inputs[0], gi_t)?;
+                    grads.accumulate(entry.inputs[1], Tensor::new(gw, vec![c]))?;
+                    grads.accumulate(entry.inputs[2], Tensor::new(gb, vec![c]))?;
+                } else {
+                    let og_c = out_grad.contiguous();
+                    let in_c = saved_input.contiguous();
+                    let wt_c = saved_weight.contiguous();
+                    let sv_c = saved_save.contiguous();
+                    let ogg = og_c.storage.data();
+                    let ing = in_c.storage.data();
+                    let wtg = wt_c.storage.data();
+                    let svg = sv_c.storage.data();
+
+                    let mut grad_in = CpuBackend::zeros(b * c * h * w);
+                    CpuBackend::batch_norm_backward(&ogg, &ing, &wtg, &svg, &mut grad_in, b, c, h, w);
+
+                    let spatial = h * w;
+                    let mut gw = CpuBackend::zeros(c);
+                    let mut gb = CpuBackend::zeros(c);
+                    for ch in 0..c {
+                        let mean = svg[ch * 2];
+                        let invstd = svg[ch * 2 + 1];
+                        for bi in 0..b {
+                            for s in 0..spatial {
+                                let idx = bi * c * spatial + ch * spatial + s;
+                                let x_hat = (ing[idx] - mean) * invstd;
+                                gw[ch] += ogg[idx] * x_hat;
+                                gb[ch] += ogg[idx];
+                            }
+                        }
+                    }
+                    drop(ogg); drop(ing); drop(wtg); drop(svg);
+
+                    grads.accumulate(entry.inputs[0], Tensor::new(grad_in, vec![b, c, h, w]))?;
+                    grads.accumulate(entry.inputs[1], Tensor::new(gw, vec![c]))?;
+                    grads.accumulate(entry.inputs[2], Tensor::new(gb, vec![c]))?;
+                }
+
+                #[cfg(not(feature = "gpu"))]
+                {
+                    let og_c = out_grad.contiguous();
+                    let in_c = saved_input.contiguous();
+                    let wt_c = saved_weight.contiguous();
+                    let sv_c = saved_save.contiguous();
+                    let ogg = og_c.storage.data();
+                    let ing = in_c.storage.data();
+                    let wtg = wt_c.storage.data();
+                    let svg = sv_c.storage.data();
+
+                    let mut grad_in = CpuBackend::zeros(b * c * h * w);
+                    CpuBackend::batch_norm_backward(&ogg, &ing, &wtg, &svg, &mut grad_in, b, c, h, w);
+
+                    let spatial = h * w;
+                    let mut gw = CpuBackend::zeros(c);
+                    let mut gb = CpuBackend::zeros(c);
+                    for ch in 0..c {
+                        let mean = svg[ch * 2];
+                        let invstd = svg[ch * 2 + 1];
+                        for bi in 0..b {
+                            for s in 0..spatial {
+                                let idx = bi * c * spatial + ch * spatial + s;
+                                let x_hat = (ing[idx] - mean) * invstd;
+                                gw[ch] += ogg[idx] * x_hat;
+                                gb[ch] += ogg[idx];
+                            }
+                        }
+                    }
+                    drop(ogg); drop(ing); drop(wtg); drop(svg);
+
+                    grads.accumulate(entry.inputs[0], Tensor::new(grad_in, vec![b, c, h, w]))?;
+                    grads.accumulate(entry.inputs[1], Tensor::new(gw, vec![c]))?;
+                    grads.accumulate(entry.inputs[2], Tensor::new(gb, vec![c]))?;
+                }
+            }
+
+            BackwardOp::AdaptiveAvgPool2d(bw) => {
+                bw.input_version.check()?;
+                let (b, c, h_in, w_in, h_out, w_out) =
+                    (bw.batch, bw.channels, bw.h_in, bw.w_in, bw.h_out, bw.w_out);
+                let in_numel = b * c * h_in * w_in;
+
+                #[cfg(feature = "gpu")]
+                if out_grad.storage.is_gpu() {
+                    use crate::backend::gpu::{
+                        compute as gpu_compute,
+                        context::{GpuContext, STORAGE_USAGE},
+                    };
+                    let ctx = GpuContext::get().expect("GPU required");
+                    let og_c = out_grad.contiguous();
+                    let og_buf = og_c.storage.gpu_buffer();
+                    let gi_buf = ctx.pool.acquire(&ctx.device, (in_numel * 4) as u64, STORAGE_USAGE);
+                    {
+                        let mut enc = ctx.device.create_command_encoder(&Default::default());
+                        enc.clear_buffer(&gi_buf, 0, None);
+                        ctx.queue.submit(std::iter::once(enc.finish()));
+                    }
+                    gpu_compute::adaptive_avg_pool2d_backward(
+                        ctx, &og_buf, &gi_buf,
+                        b as u32, c as u32, h_in as u32, w_in as u32, h_out as u32, w_out as u32,
+                    );
+                    drop(og_buf);
+                    let gi_t = Tensor::from_storage_and_layout(
+                        crate::tensor::StorageHandle::new_gpu(gi_buf, in_numel),
+                        crate::tensor::Layout::contiguous(vec![b, c, h_in, w_in]),
+                    );
+                    grads.accumulate(entry.inputs[0], gi_t)?;
+                } else {
+                    let og_c = out_grad.contiguous();
+                    let ogg = og_c.storage.data();
+                    let mut gi = CpuBackend::zeros(in_numel);
+                    CpuBackend::adaptive_avg_pool2d_backward(
+                        &ogg, &mut gi, b, c, h_in, w_in, h_out, w_out,
+                    );
+                    drop(ogg);
+                    grads.accumulate(entry.inputs[0], Tensor::new(gi, vec![b, c, h_in, w_in]))?;
+                }
+
+                #[cfg(not(feature = "gpu"))]
+                {
+                    let og_c = out_grad.contiguous();
+                    let ogg = og_c.storage.data();
+                    let mut gi = CpuBackend::zeros(in_numel);
+                    CpuBackend::adaptive_avg_pool2d_backward(
+                        &ogg, &mut gi, b, c, h_in, w_in, h_out, w_out,
+                    );
+                    drop(ogg);
+                    grads.accumulate(entry.inputs[0], Tensor::new(gi, vec![b, c, h_in, w_in]))?;
+                }
+            }
         }
 
         for &input_id in &entry.inputs {

@@ -24,6 +24,11 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M6 — Inference Mode & Dropout** | Complete |
 | **M7a — Loss Functions & GPU Optimizers** | Complete |
 | **M7b — The Training Loop** | Complete |
+| **M8a — Activations & Broadcasting** | Complete |
+| **M8b — LayerNorm & Embeddings** | Complete |
+| **M8c — BMM, Softmax & SDPA** | Complete |
+| **M8d — Transformer Block** | Complete |
+| **M9 — The Vision Stack** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -105,6 +110,46 @@ WebGPU uniform alignment (`vec4<u32>` packing). E2E tests: 3-class
 classification with AdamW + cross-entropy on CPU and GPU, Trainer API
 ergonomics, plus BufferPool recycling assertion. All 7 tests pass.
 
+**M8a — Activations & Broadcasting (Complete):** Four new activation functions
+(`sigmoid`, `tanh`, `gelu`, `leaky_relu`) with CPU + GPU forward/backward.
+N-dimensional broadcasting (`broadcast_add`, `broadcast_sub`, `broadcast_mul`)
+with stride-0 indexing, `BroadcastBinaryParams` WGSL kernel, and `reduce_sum`
+GPU kernel for backward reduction along broadcast dimensions.
+`fused_scale_kernel` for stride-aware negation (no `.contiguous()` needed).
+`BackwardOp` enum expanded to 22 variants.
+
+**M8b — LayerNorm & Embeddings (Complete):** Layer normalization with 3-phase
+WGSL kernels (forward: mean+invstd per instance; backward: per-instance
+grad_input + grad_weight product + reduce_sum for parameter gradients).
+Embedding lookup (indices as f32, CPU forward/backward — no f32 atomics in
+WGSL). `LayerNorm` and `Embedding` nn modules. Full GPU dispatch for LayerNorm
+forward and backward.
+
+**M8c — BMM, Softmax & SDPA (Complete):** Batched matrix multiplication via
+Z-axis dispatch (`dispatch_workgroups((n+15)/16, (m+15)/16, batch)`). Row-wise
+softmax with Log-Sum-Exp stability (forward + backward WGSL kernels). Scaled
+Dot-Product Attention as a composition of tracked ops (`bmm`, `softmax`,
+`broadcast_mul`). `BackwardOp` enum expanded to 25 variants.
+
+**M8d — Transformer Block (Complete):** `MultiheadAttention` with tracked head
+splitting (`reshape_tracked`, `transpose_tracked`, `contiguous_tracked`),
+per-head SDPA, and output projection. `TransformerBlock` composing MHA +
+LayerNorm + 2-layer FFN with residual connections. Causal masking via
+`broadcast_add` with upper-triangular `-1e9` matrix. E2E test: TinyGPT (2-layer
+transformer with positional embeddings) trains on CPU and generates tokens.
+`BackwardOp` enum now has 28 variants.
+
+**M9 — The Vision Stack (Complete):** `BatchNorm2d` with per-channel
+normalization, `RefCell`-based running statistics (no unsafe), train/eval
+toggle, and momentum-based EMA updates. GPU forward via WGSL `batch_norm.wgsl`
+kernel; backward via `batch_norm_bw.wgsl` for grad_input + CPU reduction for
+grad_weight/grad_bias. `ConvTranspose2d` (transposed convolution) implemented
+as a composition of tracked ops: `weight^T @ x_flat → col2im → channel_bias`.
+`AdaptiveAvgPool2d` with dynamic bin boundaries (floor-start, ceil-end) via
+WGSL `adaptive_pool.wgsl` kernel (forward + backward). All three modules
+implement `Module` trait with state_dict support. `BackwardOp` enum now has 30
+variants.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -125,7 +170,7 @@ ergonomics, plus BufferPool recycling assertion. All 7 tests pass.
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
 | `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool` |
-| `PipelineCache` | Named struct fields for 25 compute pipelines + 9 bind group layouts (no HashMap) |
+| `PipelineCache` | Named struct fields for 35+ compute pipelines + 10 bind group layouts (no HashMap) |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
@@ -136,7 +181,7 @@ ergonomics, plus BufferPool recycling assertion. All 7 tests pass.
 | `Backend` trait | Stateless associated fns (no `&self`) — `CpuBackend` is zero-sized |
 | `Tape` | Append-only Wengert list of `TapeEntry` nodes |
 | `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked |
-| `BackwardOp` | Concrete enum (16 variants) — no closures, `Send + Sync` |
+| `BackwardOp` | Concrete enum (30 variants) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
 | `Module` trait | State-only: `parameters`, `train`/`eval`, `state_dict`/`load_state_dict` — `forward` is inherent |
 | `#[derive(Module)]` | Proc macro generating all `Module` methods by iterating struct fields |
@@ -150,6 +195,16 @@ ergonomics, plus BufferPool recycling assertion. All 7 tests pass.
 | `Flatten` | Zero-copy tracked reshape `[B,C,H,W] → [B,C*H*W]` |
 | `Dropout` | Inverted scaling `1/(1-p)`, PCG hash PRNG (CPU+GPU), `train`/`eval` toggle |
 | `AdamW` | Decoupled weight decay, GPU-native moment init via `clear_buffer`, fused WGSL kernel |
+| `Sigmoid/Tanh/GeLU/LeakyReLU` | Activation functions with CPU + GPU forward/backward, save-output or save-input for backward |
+| `LayerNorm` | Layer normalization over last dim, 3-phase WGSL kernels, saves mean+invstd for backward |
+| `Embedding` | Lookup table `[vocab, dim]`, CPU sparse scatter backward (no f32 atomics in WGSL) |
+| `Bmm` | Batched matmul `[B,M,K]@[B,K,N]→[B,M,N]` via Z-axis dispatch |
+| `Softmax` | Row-wise Log-Sum-Exp softmax with WGSL forward/backward kernels |
+| `MultiheadAttention` | Tracked head splitting + per-head SDPA + output projection |
+| `TransformerBlock` | MHA + LayerNorm + 2-layer FFN with residual connections, causal masking |
+| `BatchNorm2d` | Per-channel normalization `[B,C,H,W]`, RefCell running stats, train/eval toggle, WGSL kernel |
+| `ConvTranspose2d` | Transposed convolution via `W^T @ x → col2im`, composition of tracked ops |
+| `AdaptiveAvgPool2d` | Dynamic-bin average pooling to fixed output size, WGSL forward/backward |
 | `Trainer<O>` | Closure-based `train_step()`, epoch loss tracking, no `zero_grad` needed |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 

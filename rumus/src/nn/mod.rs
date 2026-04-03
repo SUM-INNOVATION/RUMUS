@@ -1,8 +1,11 @@
 //! Neural network building blocks: parameters, modules, layers, losses, and IO.
 
 mod activations;
+mod adaptive_pool;
 pub mod attention;
+mod batch_norm;
 mod conv;
+mod conv_transpose;
 mod dropout;
 mod embedding;
 mod flatten;
@@ -16,9 +19,12 @@ mod pool;
 pub mod transformer;
 
 pub use activations::{gelu, leaky_relu, relu, sigmoid, tanh};
+pub use adaptive_pool::AdaptiveAvgPool2d;
 pub use attention::{scaled_dot_product_attention, MultiheadAttention};
+pub use batch_norm::BatchNorm2d;
 pub use transformer::TransformerBlock;
 pub use conv::Conv2d;
+pub use conv_transpose::ConvTranspose2d;
 pub use dropout::Dropout;
 pub use embedding::Embedding;
 pub use flatten::Flatten;

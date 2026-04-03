@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use crate::autograd::context;
 use crate::autograd::{
-    AddBackward, AddBiasBackward, AddChannelBiasBackward, BackwardOp, BmmBackward, TransposeBackward,
+    AdaptiveAvgPool2dBackward, AddBackward, AddBiasBackward, AddChannelBiasBackward,
+    BackwardOp, BatchNorm2dBackward, BmmBackward, TransposeBackward,
     BroadcastAddBackward, BroadcastMulBackward, BroadcastSubBackward, CrossEntropyBackward,
     DropoutBackward, EmbeddingBackward, FlattenBackward, GeluBackward, Im2ColBackward,
     LayerNormBackward, LeakyReluBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward,
@@ -1705,6 +1706,266 @@ impl Tensor {
             }
         } else {
             Tensor { storage: out_storage, layout: Layout::contiguous(shape), state: AutogradState::None }
+        }
+    }
+
+    // === BatchNorm2d ===========================================================
+
+    /// Batch normalization over `[B, C, H, W]` tensors.
+    ///
+    /// During training: computes per-channel mean/var from the batch,
+    /// updates `running_mean`/`running_var` with momentum.
+    /// During eval: uses `running_mean`/`running_var`.
+    ///
+    /// `save` receives `[C, 2]`: mean + invstd per channel (for backward).
+    /// Tape records 3 inputs: [input, weight, bias].
+    pub fn batch_norm_2d(
+        &self,
+        weight: &Tensor,
+        bias: &Tensor,
+        running_mean: &mut Vec<f32>,
+        running_var: &mut Vec<f32>,
+        epsilon: f32,
+        momentum: f32,
+        is_training: bool,
+    ) -> Tensor {
+        assert_eq!(self.ndim(), 4, "batch_norm_2d: input must be 4-D [B, C, H, W]");
+        let batch = self.shape()[0];
+        let channels = self.shape()[1];
+        let height = self.shape()[2];
+        let width = self.shape()[3];
+        assert_eq!(weight.shape(), &[channels], "batch_norm_2d: weight shape mismatch");
+        assert_eq!(bias.shape(), &[channels], "batch_norm_2d: bias shape mismatch");
+
+        let numel = batch * channels * height * width;
+        let save_len = channels * 2;
+
+        #[cfg(feature = "gpu")]
+        let (out_storage, save_storage) = if self.storage.is_gpu() {
+            let ctx = GpuContext::get().expect("GPU required");
+            let ic = self.contiguous();
+            let wc = weight.contiguous();
+            let bc = bias.contiguous();
+            let ib = ic.storage.gpu_buffer();
+            let wb = wc.storage.gpu_buffer();
+            let bb = bc.storage.gpu_buffer();
+
+            // Upload running stats to GPU
+            let rm_buf = ctx.pool.acquire(&ctx.device, (channels * 4) as u64, STORAGE_USAGE);
+            let rv_buf = ctx.pool.acquire(&ctx.device, (channels * 4) as u64, STORAGE_USAGE);
+            ctx.queue.write_buffer(&rm_buf, 0, bytemuck::cast_slice(running_mean));
+            ctx.queue.write_buffer(&rv_buf, 0, bytemuck::cast_slice(running_var));
+
+            let out_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+            let save_buf = ctx.pool.acquire(&ctx.device, (save_len * 4) as u64, STORAGE_USAGE);
+
+            gpu_compute::batch_norm_forward(
+                ctx, &ib, &wb, &bb, &rm_buf, &rv_buf, &out_buf, &save_buf,
+                batch as u32, channels as u32, height as u32, width as u32,
+                epsilon, momentum, is_training,
+            );
+
+            // Download updated running stats back to CPU
+            if is_training {
+                let tmp_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("bn_rm_readback"),
+                    size: (channels * 4) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let tmp_buf2 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("bn_rv_readback"),
+                    size: (channels * 4) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut enc = ctx.device.create_command_encoder(&Default::default());
+                enc.copy_buffer_to_buffer(&rm_buf, 0, &tmp_buf, 0, (channels * 4) as u64);
+                enc.copy_buffer_to_buffer(&rv_buf, 0, &tmp_buf2, 0, (channels * 4) as u64);
+                ctx.queue.submit(std::iter::once(enc.finish()));
+
+                let (tx, rx) = std::sync::mpsc::channel();
+                let tx2 = tx.clone();
+                tmp_buf.slice(..).map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+                tmp_buf2.slice(..).map_async(wgpu::MapMode::Read, move |r| { tx2.send(r).ok(); });
+                ctx.device.poll(wgpu::Maintain::Wait);
+                rx.recv().unwrap().unwrap();
+                rx.recv().unwrap().unwrap();
+
+                let rm_data = tmp_buf.slice(..).get_mapped_range();
+                running_mean.copy_from_slice(bytemuck::cast_slice(&rm_data));
+                drop(rm_data);
+                let rv_data = tmp_buf2.slice(..).get_mapped_range();
+                running_var.copy_from_slice(bytemuck::cast_slice(&rv_data));
+                drop(rv_data);
+            }
+
+            drop(ib); drop(wb); drop(bb);
+            ctx.pool.release(rm_buf);
+            ctx.pool.release(rv_buf);
+
+            (StorageHandle::new_gpu(out_buf, numel),
+             StorageHandle::new_gpu(save_buf, save_len))
+        } else {
+            let ic = self.contiguous();
+            let wc = weight.contiguous();
+            let bc = bias.contiguous();
+            let ig = ic.storage.data();
+            let wg = wc.storage.data();
+            let bg = bc.storage.data();
+            let mut out = CpuBackend::zeros(numel);
+            let mut save = CpuBackend::zeros(save_len);
+            CpuBackend::batch_norm_forward(
+                &ig, &wg, &bg, running_mean, running_var,
+                &mut out, &mut save,
+                batch, channels, height, width,
+                epsilon, momentum, is_training,
+            );
+            drop(ig); drop(wg); drop(bg);
+            (StorageHandle::new(out), StorageHandle::new(save))
+        };
+
+        #[cfg(not(feature = "gpu"))]
+        let (out_storage, save_storage) = {
+            let ic = self.contiguous();
+            let wc = weight.contiguous();
+            let bc = bias.contiguous();
+            let ig = ic.storage.data();
+            let wg = wc.storage.data();
+            let bg = bc.storage.data();
+            let mut out = CpuBackend::zeros(numel);
+            let mut save = CpuBackend::zeros(save_len);
+            CpuBackend::batch_norm_forward(
+                &ig, &wg, &bg, running_mean, running_var,
+                &mut out, &mut save,
+                batch, channels, height, width,
+                epsilon, momentum, is_training,
+            );
+            drop(ig); drop(wg); drop(bg);
+            (StorageHandle::new(out), StorageHandle::new(save))
+        };
+
+        let result_shape = self.shape().to_vec();
+        let any_tracked = (self.requires_grad() || weight.requires_grad() || bias.requires_grad())
+            && !context::is_no_grad();
+
+        if any_tracked {
+            let out_gid = context::next_grad_id();
+            let in_gid = require_grad_id(self).unwrap_or_else(context::next_grad_id);
+            let w_gid = require_grad_id(weight).unwrap_or_else(context::next_grad_id);
+            let b_gid = require_grad_id(bias).unwrap_or_else(context::next_grad_id);
+
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+            if let Some(m) = weight.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+            if let Some(m) = bias.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+            let weight_version = VersionSnapshot::new(w_gid, &weight.storage);
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::BatchNorm2d(BatchNorm2dBackward {
+                        input_storage: self.storage.clone(),
+                        input_layout: self.layout.clone(),
+                        input_version,
+                        weight_storage: weight.storage.clone(),
+                        weight_layout: Layout::contiguous(vec![channels]),
+                        weight_version,
+                        save_storage: save_storage.clone(),
+                        save_layout: Layout::contiguous(vec![channels, 2]),
+                        batch, channels, height, width,
+                    }),
+                    inputs: vec![in_gid, w_gid, b_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+        }
+    }
+
+    // === AdaptiveAvgPool2d =====================================================
+
+    /// Adaptive average pooling: `[B, C, H_in, W_in] → [B, C, H_out, W_out]`.
+    ///
+    /// Dynamically computes bin boundaries using floor-start / ceil-end.
+    pub fn adaptive_avg_pool2d(&self, h_out: usize, w_out: usize) -> Tensor {
+        assert_eq!(self.ndim(), 4, "adaptive_avg_pool2d: input must be 4-D [B, C, H, W]");
+        let batch = self.shape()[0];
+        let channels = self.shape()[1];
+        let h_in = self.shape()[2];
+        let w_in = self.shape()[3];
+        let out_numel = batch * channels * h_out * w_out;
+
+        let ic = self.contiguous();
+
+        #[cfg(feature = "gpu")]
+        let out_storage = if ic.storage.is_gpu() {
+            let ctx = GpuContext::get().expect("GPU required");
+            let ib = ic.storage.gpu_buffer();
+            let dst = ctx.pool.acquire(&ctx.device, (out_numel * 4) as u64, STORAGE_USAGE);
+            gpu_compute::adaptive_avg_pool2d_forward(
+                ctx, &ib, &dst,
+                batch as u32, channels as u32, h_in as u32, w_in as u32, h_out as u32, w_out as u32,
+            );
+            drop(ib);
+            StorageHandle::new_gpu(dst, out_numel)
+        } else {
+            let ig = ic.storage.data();
+            let mut out = CpuBackend::zeros(out_numel);
+            CpuBackend::adaptive_avg_pool2d(&ig, &mut out, batch, channels, h_in, w_in, h_out, w_out);
+            drop(ig);
+            StorageHandle::new(out)
+        };
+
+        #[cfg(not(feature = "gpu"))]
+        let out_storage = {
+            let ig = ic.storage.data();
+            let mut out = CpuBackend::zeros(out_numel);
+            CpuBackend::adaptive_avg_pool2d(&ig, &mut out, batch, channels, h_in, w_in, h_out, w_out);
+            drop(ig);
+            StorageHandle::new(out)
+        };
+
+        let result_shape = vec![batch, channels, h_out, w_out];
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_gid = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+            let input_version = VersionSnapshot::new(in_gid, &self.storage);
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::AdaptiveAvgPool2d(AdaptiveAvgPool2dBackward {
+                        input_version,
+                        batch, channels, h_in, w_in, h_out, w_out,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
         }
     }
 

@@ -291,6 +291,141 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn batch_norm_forward(
+        input: &[f32], weight: &[f32], bias: &[f32],
+        running_mean: &mut [f32], running_var: &mut [f32],
+        output: &mut [f32], save: &mut [f32],
+        batch: usize, channels: usize, height: usize, width: usize,
+        epsilon: f32, momentum: f32, is_training: bool,
+    ) {
+        let spatial = height * width;
+        let n = batch * spatial;
+        for c in 0..channels {
+            let (mean, var) = if is_training {
+                let mut sum = 0.0f32;
+                for b in 0..batch {
+                    for hw in 0..spatial {
+                        sum += input[b * channels * spatial + c * spatial + hw];
+                    }
+                }
+                let mean = sum / n as f32;
+                let mut var_sum = 0.0f32;
+                for b in 0..batch {
+                    for hw in 0..spatial {
+                        let d = input[b * channels * spatial + c * spatial + hw] - mean;
+                        var_sum += d * d;
+                    }
+                }
+                let var = var_sum / n as f32;
+                save[c * 2] = mean;
+                save[c * 2 + 1] = 1.0 / (var + epsilon).sqrt();
+                running_mean[c] = (1.0 - momentum) * running_mean[c] + momentum * mean;
+                running_var[c] = (1.0 - momentum) * running_var[c] + momentum * var;
+                (mean, var)
+            } else {
+                (running_mean[c], running_var[c])
+            };
+            let invstd = 1.0 / (var + epsilon).sqrt();
+            for b in 0..batch {
+                for hw in 0..spatial {
+                    let flat = b * channels * spatial + c * spatial + hw;
+                    let x_hat = (input[flat] - mean) * invstd;
+                    output[flat] = weight[c] * x_hat + bias[c];
+                }
+            }
+        }
+    }
+
+    fn batch_norm_backward(
+        grad_out: &[f32], input: &[f32], weight: &[f32], save: &[f32],
+        grad_input: &mut [f32],
+        batch: usize, channels: usize, height: usize, width: usize,
+    ) {
+        let spatial = height * width;
+        let n = batch * spatial;
+        for c in 0..channels {
+            let mean = save[c * 2];
+            let invstd = save[c * 2 + 1];
+            let gamma = weight[c];
+            let mut c1 = 0.0f32;
+            let mut c2 = 0.0f32;
+            for b in 0..batch {
+                for hw in 0..spatial {
+                    let flat = b * channels * spatial + c * spatial + hw;
+                    let gn = grad_out[flat] * gamma;
+                    let xh = (input[flat] - mean) * invstd;
+                    c1 += gn;
+                    c2 += gn * xh;
+                }
+            }
+            c1 /= n as f32;
+            c2 /= n as f32;
+            for b in 0..batch {
+                for hw in 0..spatial {
+                    let flat = b * channels * spatial + c * spatial + hw;
+                    let gn = grad_out[flat] * gamma;
+                    let xh = (input[flat] - mean) * invstd;
+                    grad_input[flat] = invstd * (gn - c1 - xh * c2);
+                }
+            }
+        }
+    }
+
+    fn adaptive_avg_pool2d(
+        input: &[f32], output: &mut [f32],
+        batch: usize, channels: usize, h_in: usize, w_in: usize, h_out: usize, w_out: usize,
+    ) {
+        let in_spatial = h_in * w_in;
+        let out_spatial = h_out * w_out;
+        for b in 0..batch {
+            for c in 0..channels {
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let hs = oh * h_in / h_out;
+                        let he = ((oh + 1) * h_in + h_out - 1) / h_out;
+                        let ws = ow * w_in / w_out;
+                        let we = ((ow + 1) * w_in + w_out - 1) / w_out;
+                        let base = b * channels * in_spatial + c * in_spatial;
+                        let count = (he - hs) * (we - ws);
+                        let mut sum = 0.0f32;
+                        for h in hs..he { for w in ws..we { sum += input[base + h * w_in + w]; } }
+                        output[b * channels * out_spatial + c * out_spatial + oh * w_out + ow] = sum / count as f32;
+                    }
+                }
+            }
+        }
+    }
+
+    fn adaptive_avg_pool2d_backward(
+        grad_out: &[f32], grad_in: &mut [f32],
+        batch: usize, channels: usize, h_in: usize, w_in: usize, h_out: usize, w_out: usize,
+    ) {
+        let in_spatial = h_in * w_in;
+        let out_spatial = h_out * w_out;
+        for b in 0..batch {
+            for c in 0..channels {
+                for ih in 0..h_in {
+                    for iw in 0..w_in {
+                        let mut g = 0.0f32;
+                        for oh in 0..h_out {
+                            let hs = oh * h_in / h_out;
+                            let he = ((oh + 1) * h_in + h_out - 1) / h_out;
+                            if ih < hs || ih >= he { continue; }
+                            for ow in 0..w_out {
+                                let ws = ow * w_in / w_out;
+                                let we = ((ow + 1) * w_in + w_out - 1) / w_out;
+                                if iw < ws || iw >= we { continue; }
+                                let count = (he - hs) * (we - ws);
+                                g += grad_out[b * channels * out_spatial + c * out_spatial + oh * w_out + ow] / count as f32;
+                            }
+                        }
+                        grad_in[b * channels * in_spatial + c * in_spatial + ih * w_in + iw] = g;
+                    }
+                }
+            }
+        }
+    }
+
     fn bmm(a: &[f32], b: &[f32], dst: &mut [f32], batch: usize, m: usize, k: usize, n: usize) {
         for bi in 0..batch {
             let a_off = bi * m * k;

@@ -257,6 +257,44 @@ pub(crate) struct SoftmaxParams {
     pub _pad1: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct BatchNorm2dParams {
+    pub batch: u32,
+    pub channels: u32,
+    pub height: u32,
+    pub width: u32,
+    pub epsilon: f32,
+    pub momentum: f32,
+    pub is_training: u32,
+    pub _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct BatchNormBwParams {
+    pub batch: u32,
+    pub channels: u32,
+    pub height: u32,
+    pub width: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct AdaptivePoolParams {
+    pub batch: u32,
+    pub channels: u32,
+    pub h_in: u32,
+    pub w_in: u32,
+    pub h_out: u32,
+    pub w_out: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<BatchNorm2dParams>() == 32);
+const _: () = assert!(std::mem::size_of::<BatchNormBwParams>() == 16);
+const _: () = assert!(std::mem::size_of::<AdaptivePoolParams>() == 32);
 const _: () = assert!(std::mem::size_of::<BmmParams>() == 16);
 const _: () = assert!(std::mem::size_of::<SoftmaxParams>() == 16);
 const _: () = assert!(std::mem::size_of::<LayerNormParams>() == 16);
@@ -1604,6 +1642,147 @@ pub(crate) fn softmax_backward_dispatch(
         pass.set_pipeline(&ctx.pipelines.softmax_backward_pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(num_rows, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// BatchNorm2d
+// ---------------------------------------------------------------------------
+
+pub(crate) fn batch_norm_forward(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer, weight: &wgpu::Buffer, bias: &wgpu::Buffer,
+    running_mean: &wgpu::Buffer, running_var: &wgpu::Buffer,
+    output: &wgpu::Buffer, save: &wgpu::Buffer,
+    batch: u32, channels: u32, height: u32, width: u32,
+    epsilon: f32, momentum: f32, is_training: bool,
+) {
+    let params = BatchNorm2dParams {
+        batch, channels, height, width, epsilon, momentum,
+        is_training: if is_training { 1 } else { 0 }, _pad: 0,
+    };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("bn_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.bn_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: weight.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: bias.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: running_mean.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: running_var.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: save.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.bn_forward_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(channels, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+pub(crate) fn batch_norm_backward(
+    ctx: &GpuContext,
+    grad_out: &wgpu::Buffer, input: &wgpu::Buffer, weight: &wgpu::Buffer,
+    save: &wgpu::Buffer, grad_in: &wgpu::Buffer,
+    batch: u32, channels: u32, height: u32, width: u32,
+) {
+    let params = BatchNormBwParams { batch, channels, height, width };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("bnbw_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.ln_bw_layout, // reuse: 6 bindings, same shape
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: grad_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: weight.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: save.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: grad_in.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.bn_backward_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(channels, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// AdaptiveAvgPool2d
+// ---------------------------------------------------------------------------
+
+pub(crate) fn adaptive_avg_pool2d_forward(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer, output: &wgpu::Buffer,
+    batch: u32, channels: u32, h_in: u32, w_in: u32, h_out: u32, w_out: u32,
+) {
+    let params = AdaptivePoolParams { batch, channels, h_in, w_in, h_out, w_out, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("ap_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let total = batch * channels * h_out * w_out;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.adaptive_pool_fwd_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+pub(crate) fn adaptive_avg_pool2d_backward(
+    ctx: &GpuContext,
+    grad_out: &wgpu::Buffer, grad_in: &wgpu::Buffer,
+    batch: u32, channels: u32, h_in: u32, w_in: u32, h_out: u32, w_out: u32,
+) {
+    let params = AdaptivePoolParams { batch, channels, h_in, w_in, h_out, w_out, _pad0: 0, _pad1: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("apbw_params"), contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: grad_out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: grad_in.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+    let total = batch * channels * h_in * w_in;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.adaptive_pool_bw_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((total + 63) / 64, 1, 1);
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
 }
