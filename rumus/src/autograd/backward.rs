@@ -29,7 +29,7 @@ fn reduce_if_broadcast(
                 let ctx = GpuContext::get().expect("GPU required");
                 let gc = grad.contiguous();
                 let gb = gc.storage.gpu_buffer();
-                let dst_buf = ctx.pool.acquire(&ctx.device, (out_numel * 4) as u64, STORAGE_USAGE);
+                let dst_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(out_numel), STORAGE_USAGE);
                 // Zero the output buffer before accumulation.
                 {
                     let mut enc = ctx.device.create_command_encoder(&Default::default());
@@ -79,7 +79,7 @@ fn negate_tensor(t: &Tensor) -> Tensor {
         };
         let ctx = GpuContext::get().expect("GPU required");
         let tb = t.storage.gpu_buffer();
-        let dst_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+        let dst_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(numel), STORAGE_USAGE);
 
         let strides = t.strides();
         let offset = t.layout.offset();
@@ -399,7 +399,7 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                     let og_buf = og_c.storage.gpu_buffer();
                     let numel = saved_grad.numel();
                     let dst_buf = ctx.pool.acquire(
-                        &ctx.device, (numel * 4) as u64, STORAGE_USAGE,
+                        &ctx.device, crate::tensor::DType::F32.gpu_buf_size(numel), STORAGE_USAGE,
                     );
                     gpu_compute::broadcast_scale(
                         ctx, &og_buf, &sg_buf, &dst_buf, numel as u32,
@@ -489,7 +489,7 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                     let og_c = out_grad.contiguous();
                     let so_buf = so_c.storage.gpu_buffer();
                     let og_buf = og_c.storage.gpu_buffer();
-                    let gi_buf = ctx.pool.acquire(&ctx.device, (num_rows * row_size * 4) as u64, STORAGE_USAGE);
+                    let gi_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(num_rows * row_size), STORAGE_USAGE);
                     gpu_compute::softmax_backward_dispatch(
                         ctx, &so_buf, &og_buf, &gi_buf,
                         num_rows as u32, row_size as u32,
@@ -551,7 +551,7 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                     let sv_buf = sv_c.storage.gpu_buffer();
 
                     // 1. grad_input via per-instance WGSL kernel
-                    let gi_buf = ctx.pool.acquire(&ctx.device, (n * d * 4) as u64, STORAGE_USAGE);
+                    let gi_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(n * d), STORAGE_USAGE);
                     gpu_compute::layer_norm_backward(
                         ctx, &og_buf, &in_buf, &wt_buf, &sv_buf, &gi_buf,
                         n as u32, d as u32,
@@ -559,13 +559,13 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
 
                     // 2. grad_weight = reduce_sum(grad_out * x_hat, dim=0)
                     //    First compute grad_out * x_hat [N, D] on GPU.
-                    let gw_product_buf = ctx.pool.acquire(&ctx.device, (n * d * 4) as u64, STORAGE_USAGE);
+                    let gw_product_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(n * d), STORAGE_USAGE);
                     gpu_compute::layer_norm_grad_weight_product(
                         ctx, &og_buf, &in_buf, &wt_buf, &sv_buf, &gw_product_buf,
                         n as u32, d as u32,
                     );
                     //    Then reduce over dim 0: [N, D] → [D]
-                    let gw_buf = ctx.pool.acquire(&ctx.device, (d * 4) as u64, STORAGE_USAGE);
+                    let gw_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(d), STORAGE_USAGE);
                     {
                         let mut enc = ctx.device.create_command_encoder(&Default::default());
                         enc.clear_buffer(&gw_buf, 0, None);
@@ -575,7 +575,7 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                     gpu_compute::reduce_sum_gpu(ctx, &gw_product_buf, &gw_buf, &gw_params);
 
                     // 3. grad_bias = reduce_sum(grad_out, dim=0): [N, D] → [D]
-                    let gb_buf = ctx.pool.acquire(&ctx.device, (d * 4) as u64, STORAGE_USAGE);
+                    let gb_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(d), STORAGE_USAGE);
                     {
                         let mut enc = ctx.device.create_command_encoder(&Default::default());
                         enc.clear_buffer(&gb_buf, 0, None);
@@ -812,7 +812,7 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                     let wt_buf = wt_c.storage.gpu_buffer();
                     let sv_buf = sv_c.storage.gpu_buffer();
 
-                    let gi_buf = ctx.pool.acquire(&ctx.device, (b * c * h * w * 4) as u64, STORAGE_USAGE);
+                    let gi_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(b * c * h * w), STORAGE_USAGE);
                     gpu_compute::batch_norm_backward(
                         ctx, &og_buf, &in_buf, &wt_buf, &sv_buf, &gi_buf,
                         b as u32, c as u32, h as u32, w as u32,
@@ -934,7 +934,7 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                     let ctx = GpuContext::get().expect("GPU required");
                     let og_c = out_grad.contiguous();
                     let og_buf = og_c.storage.gpu_buffer();
-                    let gi_buf = ctx.pool.acquire(&ctx.device, (in_numel * 4) as u64, STORAGE_USAGE);
+                    let gi_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(in_numel), STORAGE_USAGE);
                     {
                         let mut enc = ctx.device.create_command_encoder(&Default::default());
                         enc.clear_buffer(&gi_buf, 0, None);
@@ -972,6 +972,14 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                     drop(ogg);
                     grads.accumulate(entry.inputs[0], Tensor::new(gi, vec![b, c, h_in, w_in]))?;
                 }
+            }
+
+            BackwardOp::Cast(bw) => {
+                bw.input_version.check()?;
+                // The gradient of a cast is a cast in the reverse direction.
+                // to_dtype inside backward is untracked (no tape exists).
+                let grad_input = out_grad.to_dtype(bw.source_dtype);
+                grads.accumulate(entry.inputs[0], grad_input)?;
             }
         }
 

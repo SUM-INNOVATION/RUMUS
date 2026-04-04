@@ -11,9 +11,9 @@ struct EmbeddingParams {
 }
 // 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       emb_indices: array<f32>; // token IDs as f32
-@group(0) @binding(1) var<storage, read>       emb_weight:  array<f32>; // [vocab, dim]
-@group(0) @binding(2) var<storage, read_write> emb_output:  array<f32>; // [lookups, dim]
+@group(0) @binding(0) var<storage, read>       emb_indices: array<scalar>; // token IDs as f32
+@group(0) @binding(1) var<storage, read>       emb_weight:  array<scalar>; // [vocab, dim]
+@group(0) @binding(2) var<storage, read_write> emb_output:  array<scalar>; // [lookups, dim]
 @group(0) @binding(3) var<uniform>             emb_params:  EmbeddingParams;
 
 @compute @workgroup_size(64)

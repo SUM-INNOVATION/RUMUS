@@ -19,16 +19,16 @@ struct BatchNorm2dParams {
 }
 // 32 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       bn_input:        array<f32>;
-@group(0) @binding(1) var<storage, read>       bn_weight:       array<f32>; // γ [C]
-@group(0) @binding(2) var<storage, read>       bn_bias:         array<f32>; // β [C]
-@group(0) @binding(3) var<storage, read_write> bn_running_mean: array<f32>; // [C]
-@group(0) @binding(4) var<storage, read_write> bn_running_var:  array<f32>; // [C]
-@group(0) @binding(5) var<storage, read_write> bn_output:       array<f32>;
-@group(0) @binding(6) var<storage, read_write> bn_save:         array<f32>; // [C, 2]
+@group(0) @binding(0) var<storage, read>       bn_input:        array<scalar>;
+@group(0) @binding(1) var<storage, read>       bn_weight:       array<scalar>; // γ [C]
+@group(0) @binding(2) var<storage, read>       bn_bias:         array<scalar>; // β [C]
+@group(0) @binding(3) var<storage, read_write> bn_running_mean: array<scalar>; // [C]
+@group(0) @binding(4) var<storage, read_write> bn_running_var:  array<scalar>; // [C]
+@group(0) @binding(5) var<storage, read_write> bn_output:       array<scalar>;
+@group(0) @binding(6) var<storage, read_write> bn_save:         array<scalar>; // [C, 2]
 @group(0) @binding(7) var<uniform>             bn_params:       BatchNorm2dParams;
 
-var<workgroup> shared_val: array<f32, 64>;
+var<workgroup> shared_val: array<scalar, 64>;
 
 @compute @workgroup_size(64)
 fn batch_norm_forward_kernel(
@@ -41,12 +41,12 @@ fn batch_norm_forward_kernel(
     let spatial = bn_params.height * bn_params.width;
     let n = bn_params.batch * spatial;
 
-    var use_mean: f32;
-    var use_invstd: f32;
+    var use_mean: scalar;
+    var use_invstd: scalar;
 
     if (bn_params.is_training == 1u) {
         // ---- Phase 1: Mean ----
-        var local_sum: f32 = 0.0;
+        var local_sum: scalar = scalar(0.0);
         var idx = tid;
         while (idx < n) {
             let b = idx / spatial;
@@ -63,11 +63,11 @@ fn batch_norm_forward_kernel(
             workgroupBarrier();
             s = s >> 1u;
         }
-        let mean = shared_val[0] / f32(n);
+        let mean = shared_val[0] / scalar(n);
         workgroupBarrier();
 
         // ---- Phase 2: Variance ----
-        var local_var: f32 = 0.0;
+        var local_var: scalar = scalar(0.0);
         idx = tid;
         while (idx < n) {
             let b = idx / spatial;
@@ -85,8 +85,8 @@ fn batch_norm_forward_kernel(
             workgroupBarrier();
             s = s >> 1u;
         }
-        let variance = shared_val[0] / f32(n);
-        let invstd = 1.0 / sqrt(variance + bn_params.epsilon);
+        let variance = shared_val[0] / scalar(n);
+        let invstd = scalar(1.0) / sqrt(variance + scalar(bn_params.epsilon));
         workgroupBarrier();
 
         use_mean = mean;
@@ -96,14 +96,14 @@ fn batch_norm_forward_kernel(
         if (tid == 0u) {
             bn_save[c * 2u] = mean;
             bn_save[c * 2u + 1u] = invstd;
-            let m = bn_params.momentum;
-            bn_running_mean[c] = (1.0 - m) * bn_running_mean[c] + m * mean;
-            bn_running_var[c]  = (1.0 - m) * bn_running_var[c]  + m * variance;
+            let m = scalar(bn_params.momentum);
+            bn_running_mean[c] = (scalar(1.0) - m) * bn_running_mean[c] + m * mean;
+            bn_running_var[c]  = (scalar(1.0) - m) * bn_running_var[c]  + m * variance;
         }
     } else {
         // Eval mode: use running stats.
         use_mean = bn_running_mean[c];
-        use_invstd = 1.0 / sqrt(bn_running_var[c] + bn_params.epsilon);
+        use_invstd = scalar(1.0) / sqrt(bn_running_var[c] + scalar(bn_params.epsilon));
     }
     workgroupBarrier();
 

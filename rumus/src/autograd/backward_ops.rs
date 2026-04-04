@@ -427,6 +427,16 @@ pub struct AdaptiveAvgPool2dBackward {
     pub w_out: usize,
 }
 
+/// Backward for `to_dtype(target_dtype)`.
+///
+/// The gradient of a cast is simply a cast in the reverse direction.
+/// No data needs to be saved — only the source dtype for the reverse cast.
+#[derive(Debug)]
+pub struct CastBackward {
+    pub input_version: VersionSnapshot,
+    pub source_dtype: crate::tensor::DType,
+}
+
 // ---------------------------------------------------------------------------
 // BackwardOp enum
 // ---------------------------------------------------------------------------
@@ -466,6 +476,7 @@ pub enum BackwardOp {
     BroadcastMul(BroadcastMulBackward),
     BatchNorm2d(BatchNorm2dBackward),
     AdaptiveAvgPool2d(AdaptiveAvgPool2dBackward),
+    Cast(CastBackward),
 }
 
 const _: () = {

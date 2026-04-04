@@ -35,9 +35,9 @@ fn get_val(lo: vec4<u32>, hi: vec4<u32>, idx: u32) -> u32 {
     }
 }
 
-@group(0) @binding(0) var<storage, read>       fd_input:  array<f32>;
-@group(0) @binding(1) var<storage, read_write> fd_output: array<f32>;
-@group(0) @binding(2) var<storage, read_write> fd_mask:   array<f32>;
+@group(0) @binding(0) var<storage, read>       fd_input:  array<scalar>;
+@group(0) @binding(1) var<storage, read_write> fd_output: array<scalar>;
+@group(0) @binding(2) var<storage, read_write> fd_mask:   array<scalar>;
 @group(0) @binding(3) var<uniform>             fd_params: FusedDropoutParams;
 
 fn pcg_hash(input_val: u32) -> u32 {
@@ -68,7 +68,7 @@ fn fused_dropout_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
         fd_output[i] = 0.0;
         fd_mask[i] = 0.0;
     } else {
-        fd_output[i] = fd_input[src_idx] * fd_params.scale;
-        fd_mask[i] = fd_params.scale;
+        fd_output[i] = fd_input[src_idx] * scalar(fd_params.scale);
+        fd_mask[i] = scalar(fd_params.scale);
     }
 }

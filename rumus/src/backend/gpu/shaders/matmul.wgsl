@@ -13,9 +13,9 @@ struct MatmulParams {
     _pad: u32,
 }
 
-@group(0) @binding(0) var<storage, read>       a: array<f32>;
-@group(0) @binding(1) var<storage, read>       b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(0) var<storage, read>       a: array<scalar>;
+@group(0) @binding(1) var<storage, read>       b: array<scalar>;
+@group(0) @binding(2) var<storage, read_write> out: array<scalar>;
 @group(0) @binding(3) var<uniform>             params: MatmulParams;
 
 @compute @workgroup_size(16, 16)
@@ -24,7 +24,7 @@ fn matmul_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     let col = gid.x;
     if (row >= params.m || col >= params.n) { return; }
 
-    var sum: f32 = 0.0;
+    var sum: scalar = scalar(0.0);
     for (var p: u32 = 0u; p < params.k; p = p + 1u) {
         sum = sum + a[row * params.k + p] * b[p * params.n + col];
     }

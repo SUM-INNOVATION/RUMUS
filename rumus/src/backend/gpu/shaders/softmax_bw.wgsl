@@ -15,12 +15,12 @@ struct SoftmaxBwParams {
 }
 // 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       smbw_saved:    array<f32>; // softmax output
-@group(0) @binding(1) var<storage, read>       smbw_grad_out: array<f32>;
-@group(0) @binding(2) var<storage, read_write> smbw_grad_in:  array<f32>;
+@group(0) @binding(0) var<storage, read>       smbw_saved:    array<scalar>; // softmax output
+@group(0) @binding(1) var<storage, read>       smbw_grad_out: array<scalar>;
+@group(0) @binding(2) var<storage, read_write> smbw_grad_in:  array<scalar>;
 @group(0) @binding(3) var<uniform>             smbw_params:   SoftmaxBwParams;
 
-var<workgroup> shared_dot: array<f32, 64>;
+var<workgroup> shared_dot: array<scalar, 64>;
 
 @compute @workgroup_size(64)
 fn softmax_backward_kernel(
@@ -34,7 +34,7 @@ fn softmax_backward_kernel(
     let base = row * D;
 
     // Phase 1: dot = Σ grad_out[j] * saved_out[j]
-    var local_dot: f32 = 0.0;
+    var local_dot: scalar = scalar(0.0);
     var j = tid;
     while (j < D) {
         local_dot += smbw_grad_out[base + j] * smbw_saved[base + j];

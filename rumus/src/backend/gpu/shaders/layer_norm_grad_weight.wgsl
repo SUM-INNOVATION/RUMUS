@@ -19,11 +19,11 @@ struct LnGradWeightParams {
     _pad1: u32,
 }
 
-@group(0) @binding(0) var<storage, read>       gw_grad_out: array<f32>;
-@group(0) @binding(1) var<storage, read>       gw_input:    array<f32>;
-@group(0) @binding(2) var<storage, read>       gw_unused:   array<f32>;
-@group(0) @binding(3) var<storage, read>       gw_save:     array<f32>;
-@group(0) @binding(4) var<storage, read_write> gw_output:   array<f32>;
+@group(0) @binding(0) var<storage, read>       gw_grad_out: array<scalar>;
+@group(0) @binding(1) var<storage, read>       gw_input:    array<scalar>;
+@group(0) @binding(2) var<storage, read>       gw_unused:   array<scalar>;
+@group(0) @binding(3) var<storage, read>       gw_save:     array<scalar>;
+@group(0) @binding(4) var<storage, read_write> gw_output:   array<scalar>;
 @group(0) @binding(5) var<uniform>             gw_params:   LnGradWeightParams;
 
 @compute @workgroup_size(64)

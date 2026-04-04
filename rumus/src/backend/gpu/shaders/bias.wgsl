@@ -10,9 +10,9 @@ struct BiasParams {
     _pad1: u32,
 }
 
-@group(0) @binding(0) var<storage, read>       matrix: array<f32>;
-@group(0) @binding(1) var<storage, read>       bias: array<f32>;
-@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(0) var<storage, read>       matrix: array<scalar>;
+@group(0) @binding(1) var<storage, read>       bias: array<scalar>;
+@group(0) @binding(2) var<storage, read_write> out: array<scalar>;
 @group(0) @binding(3) var<uniform>             params: BiasParams;
 
 // Dispatch: ((m*n + 63) / 64, 1, 1)
@@ -30,7 +30,7 @@ fn add_bias_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn sum_rows_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     let col = gid.x;
     if (col >= params.n) { return; }
-    var sum: f32 = 0.0;
+    var sum: scalar = scalar(0.0);
     for (var row: u32 = 0u; row < params.m; row = row + 1u) {
         sum = sum + matrix[row * params.n + col];
     }

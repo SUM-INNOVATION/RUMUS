@@ -17,8 +17,8 @@ struct AdaptivePoolParams {
 
 // --- Forward ---
 
-@group(0) @binding(0) var<storage, read>       ap_input:  array<f32>;
-@group(0) @binding(1) var<storage, read_write> ap_output: array<f32>;
+@group(0) @binding(0) var<storage, read>       ap_input:  array<scalar>;
+@group(0) @binding(1) var<storage, read_write> ap_output: array<scalar>;
 @group(0) @binding(2) var<uniform>             ap_params: AdaptivePoolParams;
 
 @compute @workgroup_size(64)
@@ -42,20 +42,20 @@ fn adaptive_avg_pool2d_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     let base = b * ap_params.channels * in_spatial + c * in_spatial;
     let count = (h_end - h_start) * (w_end - w_start);
 
-    var sum: f32 = 0.0;
+    var sum: scalar = scalar(0.0);
     for (var h: u32 = h_start; h < h_end; h++) {
         for (var w: u32 = w_start; w < w_end; w++) {
             sum += ap_input[base + h * ap_params.w_in + w];
         }
     }
-    ap_output[idx] = sum / f32(count);
+    ap_output[idx] = sum / scalar(count);
 }
 
 // --- Backward: thread per input element ---
 // Each input element determines which output bins contain it and accumulates.
 
-@group(0) @binding(0) var<storage, read>       apbw_grad_out: array<f32>;
-@group(0) @binding(1) var<storage, read_write> apbw_grad_in:  array<f32>;
+@group(0) @binding(0) var<storage, read>       apbw_grad_out: array<scalar>;
+@group(0) @binding(1) var<storage, read_write> apbw_grad_in:  array<scalar>;
 @group(0) @binding(2) var<uniform>             apbw_params:   AdaptivePoolParams;
 
 @compute @workgroup_size(64)
@@ -73,7 +73,7 @@ fn adaptive_avg_pool2d_backward_kernel(@builtin(global_invocation_id) gid: vec3<
     let out_spatial = apbw_params.h_out * apbw_params.w_out;
     let out_base = b * apbw_params.channels * out_spatial + c * out_spatial;
 
-    var grad_val: f32 = 0.0;
+    var grad_val: scalar = scalar(0.0);
     // Find which output bins cover this input pixel.
     for (var oh: u32 = 0u; oh < apbw_params.h_out; oh++) {
         let h_start = oh * apbw_params.h_in / apbw_params.h_out;
@@ -84,7 +84,7 @@ fn adaptive_avg_pool2d_backward_kernel(@builtin(global_invocation_id) gid: vec3<
             let w_end = ((ow + 1u) * apbw_params.w_in + apbw_params.w_out - 1u) / apbw_params.w_out;
             if (iw < w_start || iw >= w_end) { continue; }
             let count = (h_end - h_start) * (w_end - w_start);
-            grad_val += apbw_grad_out[out_base + oh * apbw_params.w_out + ow] / f32(count);
+            grad_val += apbw_grad_out[out_base + oh * apbw_params.w_out + ow] / scalar(count);
         }
     }
     apbw_grad_in[idx] = grad_val;

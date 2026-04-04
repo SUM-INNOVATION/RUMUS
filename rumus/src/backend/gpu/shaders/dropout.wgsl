@@ -16,9 +16,9 @@ struct DropoutParams {
 }
 // 4 * 4 = 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       dropout_input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> dropout_output: array<f32>;
-@group(0) @binding(2) var<storage, read_write> dropout_mask: array<f32>;
+@group(0) @binding(0) var<storage, read>       dropout_input: array<scalar>;
+@group(0) @binding(1) var<storage, read_write> dropout_output: array<scalar>;
+@group(0) @binding(2) var<storage, read_write> dropout_mask: array<scalar>;
 @group(0) @binding(3) var<uniform>             dropout_params: DropoutParams;
 
 /// PCG-style hash: mix a single u32 into a pseudorandom u32.
@@ -42,7 +42,7 @@ fn dropout_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
         dropout_mask[i] = 0.0;
     } else {
         // Kept, scaled by 1/(1-p).
-        dropout_output[i] = dropout_input[i] * dropout_params.scale;
-        dropout_mask[i] = dropout_params.scale;
+        dropout_output[i] = dropout_input[i] * scalar(dropout_params.scale);
+        dropout_mask[i] = scalar(dropout_params.scale);
     }
 }

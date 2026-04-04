@@ -54,11 +54,16 @@ impl Optimizer for Adam {
         let bc2 = 1.0 - self.beta2.powi(t as i32);
 
         for param in &self.params {
-            let grad = grads
+            let raw_grad = grads
                 .remove(param.grad_id())
                 .ok_or(AutogradError::MissingGrad {
                     grad_id: param.grad_id(),
                 })?;
+            let grad = if raw_grad.dtype() != crate::tensor::DType::F32 {
+                raw_grad.to_dtype(crate::tensor::DType::F32)
+            } else {
+                raw_grad
+            };
             let numel = param.tensor.numel();
             let shape = param.tensor.shape().to_vec();
 

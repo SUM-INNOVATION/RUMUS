@@ -41,8 +41,8 @@ fn get_val(lo: vec4<u32>, hi: vec4<u32>, idx: u32) -> u32 {
     }
 }
 
-@group(0) @binding(0) var<storage, read>       fs_input:  array<f32>;
-@group(0) @binding(1) var<storage, read_write> fs_output: array<f32>;
+@group(0) @binding(0) var<storage, read>       fs_input:  array<scalar>;
+@group(0) @binding(1) var<storage, read_write> fs_output: array<scalar>;
 @group(0) @binding(2) var<uniform>             fs_params: FusedScaleParams;
 
 @compute @workgroup_size(64)
@@ -61,5 +61,5 @@ fn fused_scale_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
         src_idx += coord * stride;
     }
 
-    fs_output[i] = fs_input[src_idx] * fs_params.scalar;
+    fs_output[i] = fs_input[src_idx] * scalar(fs_params.scalar);
 }

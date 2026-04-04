@@ -22,8 +22,8 @@ struct Im2ColParams {
 //   num_patches = out_h * out_w
 // Each thread writes one element of the output matrix.
 
-@group(0) @binding(0) var<storage, read>       im2col_input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> im2col_output: array<f32>;
+@group(0) @binding(0) var<storage, read>       im2col_input: array<scalar>;
+@group(0) @binding(1) var<storage, read_write> im2col_output: array<scalar>;
 @group(0) @binding(2) var<uniform>             im2col_params: Im2ColParams;
 
 @compute @workgroup_size(64)
@@ -62,8 +62,8 @@ fn im2col_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Each thread handles one pixel of the output, accumulating from all
 // overlapping patches.
 
-@group(0) @binding(0) var<storage, read>       col2im_input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> col2im_output: array<f32>;
+@group(0) @binding(0) var<storage, read>       col2im_input: array<scalar>;
+@group(0) @binding(1) var<storage, read_write> col2im_output: array<scalar>;
 @group(0) @binding(2) var<uniform>             col2im_params: Im2ColParams;
 
 @compute @workgroup_size(64)
@@ -79,7 +79,7 @@ fn col2im_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     let iw = hw % p.w;
 
     let num_patches = p.out_h * p.out_w;
-    var sum: f32 = 0.0;
+    var sum: scalar = scalar(0.0);
 
     for (var kh: u32 = 0u; kh < p.k; kh++) {
         for (var kw: u32 = 0u; kw < p.k; kw++) {
@@ -115,9 +115,9 @@ struct ChannelBiasParams {
 }
 // 4 * 4 = 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       chb_src:  array<f32>;
-@group(0) @binding(1) var<storage, read>       chb_bias: array<f32>;
-@group(0) @binding(2) var<storage, read_write> chb_out:  array<f32>;
+@group(0) @binding(0) var<storage, read>       chb_src:  array<scalar>;
+@group(0) @binding(1) var<storage, read>       chb_bias: array<scalar>;
+@group(0) @binding(2) var<storage, read_write> chb_out:  array<scalar>;
 @group(0) @binding(3) var<uniform>             chb_params: ChannelBiasParams;
 
 @compute @workgroup_size(64)
@@ -133,16 +133,16 @@ fn add_channel_bias_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Reduces [C, spatial] → [C] by summing over the spatial dimension.
 // Each thread handles one channel.
 
-@group(0) @binding(0) var<storage, read>       scbg_src: array<f32>;
-@group(0) @binding(1) var<storage, read>       scbg_dummy: array<f32>;
-@group(0) @binding(2) var<storage, read_write> scbg_out: array<f32>;
+@group(0) @binding(0) var<storage, read>       scbg_src: array<scalar>;
+@group(0) @binding(1) var<storage, read>       scbg_dummy: array<scalar>;
+@group(0) @binding(2) var<storage, read_write> scbg_out: array<scalar>;
 @group(0) @binding(3) var<uniform>             scbg_params: ChannelBiasParams;
 
 @compute @workgroup_size(64)
 fn sum_channel_bias_grad_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
     if (c >= scbg_params.channels) { return; }
-    var sum: f32 = 0.0;
+    var sum: scalar = scalar(0.0);
     for (var s: u32 = 0u; s < scbg_params.spatial; s++) {
         sum += scbg_src[c * scbg_params.spatial + s];
     }

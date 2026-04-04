@@ -31,11 +31,17 @@ impl SGD {
 impl Optimizer for SGD {
     fn step(&mut self, grads: &mut GradientStore) -> Result<(), AutogradError> {
         for param in &self.params {
-            let grad = grads
+            let raw_grad = grads
                 .remove(param.grad_id())
                 .ok_or(AutogradError::MissingGrad {
                     grad_id: param.grad_id(),
                 })?;
+            // Cast F16 gradients to F32 for master weight update.
+            let grad = if raw_grad.dtype() != crate::tensor::DType::F32 {
+                raw_grad.to_dtype(crate::tensor::DType::F32)
+            } else {
+                raw_grad
+            };
             let numel = param.tensor.numel();
 
             // Ensure velocity buffer exists (needed for both GPU and CPU

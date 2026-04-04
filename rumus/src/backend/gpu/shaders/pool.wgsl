@@ -23,9 +23,9 @@ struct MaxPool2dParams {
 // indices: [channels, out_h, out_w]   (binding 2, rw) — stored as f32
 // Each thread handles one output element.
 
-@group(0) @binding(0) var<storage, read>       pool_input:   array<f32>;
-@group(0) @binding(1) var<storage, read_write> pool_output:  array<f32>;
-@group(0) @binding(2) var<storage, read_write> pool_indices: array<f32>;
+@group(0) @binding(0) var<storage, read>       pool_input:   array<scalar>;
+@group(0) @binding(1) var<storage, read_write> pool_output:  array<scalar>;
+@group(0) @binding(2) var<storage, read_write> pool_indices: array<scalar>;
 @group(0) @binding(3) var<uniform>             pool_params:  MaxPool2dParams;
 
 @compute @workgroup_size(64)
@@ -40,7 +40,7 @@ fn max_pool2d_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     let oh  = rem / p.out_w;
     let ow  = rem % p.out_w;
 
-    var max_val: f32 = -3.402823e+38;
+    var max_val: scalar = scalar(-3.402823e+38);
     var max_idx: u32 = 0u;
 
     for (var kh: u32 = 0u; kh < p.k; kh++) {
@@ -56,7 +56,7 @@ fn max_pool2d_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     pool_output[idx] = max_val;
-    pool_indices[idx] = f32(max_idx);
+    pool_indices[idx] = scalar(max_idx);
 }
 
 // --- Backward ---------------------------------------------------------------
@@ -66,9 +66,9 @@ fn max_pool2d_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Each thread handles one output element, scatters to the argmax position.
 // Safe when stride >= kernel_size (no overlapping windows).
 
-@group(0) @binding(0) var<storage, read>       pool_bw_out_grad:   array<f32>;
-@group(0) @binding(1) var<storage, read>       pool_bw_indices:    array<f32>;
-@group(0) @binding(2) var<storage, read_write> pool_bw_grad_input: array<f32>;
+@group(0) @binding(0) var<storage, read>       pool_bw_out_grad:   array<scalar>;
+@group(0) @binding(1) var<storage, read>       pool_bw_indices:    array<scalar>;
+@group(0) @binding(2) var<storage, read_write> pool_bw_grad_input: array<scalar>;
 @group(0) @binding(3) var<uniform>             pool_bw_params:     MaxPool2dParams;
 
 @compute @workgroup_size(64)

@@ -16,14 +16,14 @@ struct LayerNormParams {
 }
 // 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       ln_input:  array<f32>;
-@group(0) @binding(1) var<storage, read>       ln_weight: array<f32>; // γ [D]
-@group(0) @binding(2) var<storage, read>       ln_bias:   array<f32>; // β [D]
-@group(0) @binding(3) var<storage, read_write> ln_output: array<f32>;
-@group(0) @binding(4) var<storage, read_write> ln_save:   array<f32>; // [num_instances, 2]
+@group(0) @binding(0) var<storage, read>       ln_input:  array<scalar>;
+@group(0) @binding(1) var<storage, read>       ln_weight: array<scalar>; // γ [D]
+@group(0) @binding(2) var<storage, read>       ln_bias:   array<scalar>; // β [D]
+@group(0) @binding(3) var<storage, read_write> ln_output: array<scalar>;
+@group(0) @binding(4) var<storage, read_write> ln_save:   array<scalar>; // [num_instances, 2]
 @group(0) @binding(5) var<uniform>             ln_params: LayerNormParams;
 
-var<workgroup> shared_val: array<f32, 64>;
+var<workgroup> shared_val: array<scalar, 64>;
 
 @compute @workgroup_size(64)
 fn layer_norm_forward_kernel(
@@ -37,7 +37,7 @@ fn layer_norm_forward_kernel(
     let base = inst * D;
 
     // ---- Phase 1: Mean ----
-    var local_sum: f32 = 0.0;
+    var local_sum: scalar = scalar(0.0);
     var j = tid;
     while (j < D) {
         local_sum += ln_input[base + j];
@@ -52,11 +52,11 @@ fn layer_norm_forward_kernel(
         workgroupBarrier();
         s = s >> 1u;
     }
-    let mean = shared_val[0] / f32(D);
+    let mean = shared_val[0] / scalar(D);
     workgroupBarrier();
 
     // ---- Phase 2: Variance ----
-    var local_var: f32 = 0.0;
+    var local_var: scalar = scalar(0.0);
     j = tid;
     while (j < D) {
         let diff = ln_input[base + j] - mean;
@@ -72,8 +72,8 @@ fn layer_norm_forward_kernel(
         workgroupBarrier();
         s = s >> 1u;
     }
-    let variance = shared_val[0] / f32(D);
-    let invstd = 1.0 / sqrt(variance + ln_params.epsilon);
+    let variance = shared_val[0] / scalar(D);
+    let invstd = scalar(1.0) / sqrt(variance + scalar(ln_params.epsilon));
     workgroupBarrier();
 
     // Save mean + invstd for backward.

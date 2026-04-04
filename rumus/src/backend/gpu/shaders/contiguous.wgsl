@@ -31,8 +31,8 @@ fn get_val(lo: vec4<u32>, hi: vec4<u32>, idx: u32) -> u32 {
     }
 }
 
-@group(0) @binding(0) var<storage, read>       cont_src: array<f32>;
-@group(0) @binding(1) var<storage, read_write> cont_dst: array<f32>;
+@group(0) @binding(0) var<storage, read>       cont_src: array<scalar>;
+@group(0) @binding(1) var<storage, read_write> cont_dst: array<scalar>;
 @group(0) @binding(2) var<uniform>             cont_params: ContiguousParams;
 
 @compute @workgroup_size(64)

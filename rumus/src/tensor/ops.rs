@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::autograd::context;
 use crate::autograd::{
     AdaptiveAvgPool2dBackward, AddBackward, AddBiasBackward, AddChannelBiasBackward,
-    BackwardOp, BatchNorm2dBackward, BmmBackward, TransposeBackward,
+    BackwardOp, BatchNorm2dBackward, BmmBackward, CastBackward, TransposeBackward,
     BroadcastAddBackward, BroadcastMulBackward, BroadcastSubBackward, CrossEntropyBackward,
     DropoutBackward, EmbeddingBackward, FlattenBackward, GeluBackward, Im2ColBackward,
     LayerNormBackward, LeakyReluBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward,
@@ -82,7 +82,7 @@ impl Tensor {
         if self.storage.is_gpu() {
             let ctx = GpuContext::get().expect("GPU required");
             let src_buf = self.storage.gpu_buffer();
-            let dst_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+            let dst_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(numel), STORAGE_USAGE);
             gpu_compute::contiguous_copy(
                 ctx, &src_buf, &dst_buf,
                 numel as u32, ndim as u32, offset as u32,
@@ -158,7 +158,7 @@ fn gpu_binary(
     let numel = lhs.numel();
     let lb = lhs.storage.gpu_buffer();
     let rb = rhs.storage.gpu_buffer();
-    let dst = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+    let dst = ctx.pool.acquire(&ctx.device, lhs.dtype().gpu_buf_size(numel), STORAGE_USAGE);
     dispatch(ctx, &lb, &rb, &dst, numel as u32);
     drop(lb);
     drop(rb);
@@ -249,7 +249,7 @@ where
         let rhs_c = rhs.contiguous();
         let lb = lhs_c.storage.gpu_buffer();
         let rb = rhs_c.storage.gpu_buffer();
-        let dst_buf = ctx.pool.acquire(&ctx.device, (out_numel * 4) as u64, STORAGE_USAGE);
+        let dst_buf = ctx.pool.acquire(&ctx.device, lhs.dtype().gpu_buf_size(out_numel), STORAGE_USAGE);
         let params = gpu_compute::make_broadcast_params(
             out_numel, out_shape.len(), &suffix, &a_strides, &b_strides,
         );
@@ -484,7 +484,7 @@ impl Tensor {
             let ctx = GpuContext::get().expect("GPU required");
             let lb = lhs_c.storage.gpu_buffer();
             let rb = rhs_c.storage.gpu_buffer();
-            let dst = ctx.pool.acquire(&ctx.device, (m * n * 4) as u64, STORAGE_USAGE);
+            let dst = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(m * n), STORAGE_USAGE);
             gpu_compute::matmul(ctx, &lb, &rb, &dst, m as u32, k as u32, n as u32);
             drop(lb); drop(rb);
             StorageHandle::new_gpu(dst, m * n)
@@ -529,7 +529,7 @@ impl Tensor {
         let out_storage = if input_c.storage.is_gpu() {
             let ctx = GpuContext::get().expect("GPU required");
             let ib = input_c.storage.gpu_buffer();
-            let dst = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+            let dst = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(numel), STORAGE_USAGE);
             gpu_compute::relu(ctx, &ib, &dst, numel as u32);
             drop(ib);
             StorageHandle::new_gpu(dst, numel)
@@ -684,8 +684,8 @@ impl Tensor {
             let lb = logits_c.storage.gpu_buffer();
             targets_c.storage.ensure_gpu();
             let tb = targets_c.storage.gpu_buffer();
-            let grad_buf = ctx.pool.acquire(&ctx.device, (batch * num_classes * 4) as u64, STORAGE_USAGE);
-            let loss_per_b_buf = ctx.pool.acquire(&ctx.device, (batch * 4) as u64, STORAGE_USAGE);
+            let grad_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(batch * num_classes), STORAGE_USAGE);
+            let loss_per_b_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(batch), STORAGE_USAGE);
             let loss_scalar_buf = ctx.pool.acquire(&ctx.device, 4u64, STORAGE_USAGE);
 
             gpu_compute::cross_entropy_forward(
@@ -780,7 +780,7 @@ impl Tensor {
             let ctx = GpuContext::get().expect("GPU required");
             let mb = mat_c.storage.gpu_buffer();
             let bb = bias_c.storage.gpu_buffer();
-            let dst = ctx.pool.acquire(&ctx.device, (m * n * 4) as u64, STORAGE_USAGE);
+            let dst = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(m * n), STORAGE_USAGE);
             gpu_compute::add_bias(ctx, &mb, &bb, &dst, m as u32, n as u32);
             drop(mb); drop(bb);
             StorageHandle::new_gpu(dst, m * n)
@@ -1198,8 +1198,8 @@ impl Tensor {
         let (out_storage, mask_storage) = if self.storage.is_gpu() {
             let ctx = GpuContext::get().expect("GPU required");
             let ib = self.storage.gpu_buffer();
-            let out_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
-            let mask_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
+            let out_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(numel), STORAGE_USAGE);
+            let mask_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(numel), STORAGE_USAGE);
 
             let shape = self.layout.shape();
             let strides = self.layout.strides();
@@ -1389,7 +1389,7 @@ impl Tensor {
             let ctx = GpuContext::get().expect("GPU required");
             let lb = lhs_c.storage.gpu_buffer();
             let rb = rhs_c.storage.gpu_buffer();
-            let dst_buf = ctx.pool.acquire(&ctx.device, (out_numel * 4) as u64, STORAGE_USAGE);
+            let dst_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(out_numel), STORAGE_USAGE);
             {
                 let mut enc = ctx.device.create_command_encoder(&Default::default());
                 enc.clear_buffer(&dst_buf, 0, None);
@@ -1546,7 +1546,7 @@ impl Tensor {
         let (out_storage, out_storage_for_save) = if ic.storage.is_gpu() {
             let ctx = GpuContext::get().expect("GPU required");
             let ib = ic.storage.gpu_buffer();
-            let ob = ctx.pool.acquire(&ctx.device, (self.numel() * 4) as u64, STORAGE_USAGE);
+            let ob = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(self.numel()), STORAGE_USAGE);
             gpu_compute::softmax_forward_dispatch(ctx, &ib, &ob, num_rows as u32, row_size as u32);
             drop(ib);
             let sh = StorageHandle::new_gpu(ob, self.numel());
@@ -1623,8 +1623,8 @@ impl Tensor {
             let ib = ic.storage.gpu_buffer();
             let wb = wc.storage.gpu_buffer();
             let bb = bc.storage.gpu_buffer();
-            let out_buf = ctx.pool.acquire(&ctx.device, (self.numel() * 4) as u64, STORAGE_USAGE);
-            let save_buf = ctx.pool.acquire(&ctx.device, (num_instances * 2 * 4) as u64, STORAGE_USAGE);
+            let out_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(self.numel()), STORAGE_USAGE);
+            let save_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(num_instances * 2), STORAGE_USAGE);
             gpu_compute::layer_norm_forward(
                 ctx, &ib, &wb, &bb, &out_buf, &save_buf,
                 num_instances as u32, norm_size as u32, epsilon,
@@ -1751,13 +1751,13 @@ impl Tensor {
             let bb = bc.storage.gpu_buffer();
 
             // Upload running stats to GPU
-            let rm_buf = ctx.pool.acquire(&ctx.device, (channels * 4) as u64, STORAGE_USAGE);
-            let rv_buf = ctx.pool.acquire(&ctx.device, (channels * 4) as u64, STORAGE_USAGE);
+            let rm_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(channels), STORAGE_USAGE);
+            let rv_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(channels), STORAGE_USAGE);
             ctx.queue.write_buffer(&rm_buf, 0, bytemuck::cast_slice(running_mean));
             ctx.queue.write_buffer(&rv_buf, 0, bytemuck::cast_slice(running_var));
 
-            let out_buf = ctx.pool.acquire(&ctx.device, (numel * 4) as u64, STORAGE_USAGE);
-            let save_buf = ctx.pool.acquire(&ctx.device, (save_len * 4) as u64, STORAGE_USAGE);
+            let out_buf = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(numel), STORAGE_USAGE);
+            let save_buf = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(save_len), STORAGE_USAGE);
 
             gpu_compute::batch_norm_forward(
                 ctx, &ib, &wb, &bb, &rm_buf, &rv_buf, &out_buf, &save_buf,
@@ -1769,19 +1769,19 @@ impl Tensor {
             if is_training {
                 let tmp_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("bn_rm_readback"),
-                    size: (channels * 4) as u64,
+                    size: crate::tensor::DType::F32.gpu_buf_size(channels),
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 });
                 let tmp_buf2 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("bn_rv_readback"),
-                    size: (channels * 4) as u64,
+                    size: crate::tensor::DType::F32.gpu_buf_size(channels),
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 });
                 let mut enc = ctx.device.create_command_encoder(&Default::default());
-                enc.copy_buffer_to_buffer(&rm_buf, 0, &tmp_buf, 0, (channels * 4) as u64);
-                enc.copy_buffer_to_buffer(&rv_buf, 0, &tmp_buf2, 0, (channels * 4) as u64);
+                enc.copy_buffer_to_buffer(&rm_buf, 0, &tmp_buf, 0, crate::tensor::DType::F32.gpu_buf_size(channels));
+                enc.copy_buffer_to_buffer(&rv_buf, 0, &tmp_buf2, 0, crate::tensor::DType::F32.gpu_buf_size(channels));
                 ctx.queue.submit(std::iter::once(enc.finish()));
 
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -1912,7 +1912,7 @@ impl Tensor {
         let out_storage = if ic.storage.is_gpu() {
             let ctx = GpuContext::get().expect("GPU required");
             let ib = ic.storage.gpu_buffer();
-            let dst = ctx.pool.acquire(&ctx.device, (out_numel * 4) as u64, STORAGE_USAGE);
+            let dst = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(out_numel), STORAGE_USAGE);
             gpu_compute::adaptive_avg_pool2d_forward(
                 ctx, &ib, &dst,
                 batch as u32, channels as u32, h_in as u32, w_in as u32, h_out as u32, w_out as u32,
@@ -2073,6 +2073,90 @@ impl Tensor {
                     output_shape: out_shape,
                 })
             })
+    }
+
+    // === DType casting =========================================================
+
+    /// Cast tensor to a different element type.
+    ///
+    /// `F32 → F16`: dispatches a GPU cast kernel. Requires GPU support for `shader-f16`.
+    /// `F16 → F32`: dispatches a GPU cast kernel.
+    /// Same dtype: returns `self.clone()` (zero-copy).
+    ///
+    /// The backward pass is a cast in the reverse direction.
+    pub fn to_dtype(&self, target: crate::tensor::DType) -> Tensor {
+        if self.dtype() == target {
+            return self.clone();
+        }
+
+        #[allow(unused_variables)]
+        let numel = self.numel();
+        #[allow(unused_variables)]
+        let result_shape = self.shape().to_vec();
+
+        #[cfg(feature = "gpu")]
+        let out_storage = {
+            use crate::tensor::DType;
+            let ctx = GpuContext::get().expect("GPU required for dtype cast");
+            assert!(ctx.supports_f16, "GPU does not support shader-f16; cannot cast to F16");
+
+            let ic = self.contiguous();
+            let ib = ic.storage.gpu_buffer();
+
+            match (self.dtype(), target) {
+                (DType::F32, DType::F16) => {
+                    // F32 → F16: output buffer is numel * 2 bytes (aligned to 4).
+                    let byte_size = ((numel * 2 + 3) & !3) as u64;
+                    let dst = ctx.pool.acquire(&ctx.device, byte_size, STORAGE_USAGE);
+                    gpu_compute::cast_f32_to_f16_dispatch(ctx, &ib, &dst, numel as u32);
+                    drop(ib);
+                    StorageHandle::new_gpu_f16(dst, numel)
+                }
+                (DType::F16, DType::F32) => {
+                    let dst = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(numel), STORAGE_USAGE);
+                    gpu_compute::cast_f16_to_f32_dispatch(ctx, &ib, &dst, numel as u32);
+                    drop(ib);
+                    StorageHandle::new_gpu(dst, numel)
+                }
+                _ => unreachable!("same dtype handled above"),
+            }
+        };
+
+        #[cfg(not(feature = "gpu"))]
+        #[allow(unused)]
+        let out_storage = {
+            panic!("dtype casting requires GPU feature");
+            #[allow(unreachable_code)]
+            StorageHandle::new(vec![])
+        };
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_gid = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::Cast(CastBackward {
+                        input_version: VersionSnapshot::new(in_gid, &self.storage),
+                        source_dtype: self.dtype(),
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+        }
     }
 
     /// Flatten all dimensions after the first into a single dimension.

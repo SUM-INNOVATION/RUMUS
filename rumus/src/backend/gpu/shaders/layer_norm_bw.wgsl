@@ -16,15 +16,15 @@ struct LayerNormBwParams {
 }
 // 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       lnbw_grad_out:  array<f32>; // [N, D]
-@group(0) @binding(1) var<storage, read>       lnbw_input:     array<f32>; // [N, D]
-@group(0) @binding(2) var<storage, read>       lnbw_weight:    array<f32>; // [D]
-@group(0) @binding(3) var<storage, read>       lnbw_save:      array<f32>; // [N, 2]
-@group(0) @binding(4) var<storage, read_write> lnbw_grad_in:   array<f32>; // [N, D]
+@group(0) @binding(0) var<storage, read>       lnbw_grad_out:  array<scalar>; // [N, D]
+@group(0) @binding(1) var<storage, read>       lnbw_input:     array<scalar>; // [N, D]
+@group(0) @binding(2) var<storage, read>       lnbw_weight:    array<scalar>; // [D]
+@group(0) @binding(3) var<storage, read>       lnbw_save:      array<scalar>; // [N, 2]
+@group(0) @binding(4) var<storage, read_write> lnbw_grad_in:   array<scalar>; // [N, D]
 @group(0) @binding(5) var<uniform>             lnbw_params:    LayerNormBwParams;
 
-var<workgroup> shared_c1: array<f32, 64>;
-var<workgroup> shared_c2: array<f32, 64>;
+var<workgroup> shared_c1: array<scalar, 64>;
+var<workgroup> shared_c2: array<scalar, 64>;
 
 @compute @workgroup_size(64)
 fn layer_norm_backward_kernel(
@@ -41,8 +41,8 @@ fn layer_norm_backward_kernel(
 
     // ---- Reduction 1: c1 = (1/D) * Σ grad_norm[j] ----
     // ---- Reduction 2: c2 = (1/D) * Σ grad_norm[j] * x_hat[j] ----
-    var local_c1: f32 = 0.0;
-    var local_c2: f32 = 0.0;
+    var local_c1: scalar = scalar(0.0);
+    var local_c2: scalar = scalar(0.0);
     var j = tid;
     while (j < D) {
         let grad_norm_j = lnbw_grad_out[base + j] * lnbw_weight[j];
@@ -64,8 +64,8 @@ fn layer_norm_backward_kernel(
         workgroupBarrier();
         s = s >> 1u;
     }
-    let c1 = shared_c1[0] / f32(D);
-    let c2 = shared_c2[0] / f32(D);
+    let c1 = shared_c1[0] / scalar(D);
+    let c2 = shared_c2[0] / scalar(D);
     workgroupBarrier();
 
     // ---- Element-wise: grad_input ----

@@ -18,13 +18,13 @@ struct CrossEntropyParams {
 
 // --- Pass 1: Forward + Gradient ---
 
-@group(0) @binding(0) var<storage, read>       ce_logits:     array<f32>;  // [B, C]
-@group(0) @binding(1) var<storage, read>       ce_targets:    array<f32>;  // [B] (class indices as f32)
-@group(0) @binding(2) var<storage, read_write> ce_grad:       array<f32>;  // [B, C]
-@group(0) @binding(3) var<storage, read_write> ce_loss_per_b: array<f32>;  // [B]
+@group(0) @binding(0) var<storage, read>       ce_logits:     array<scalar>;  // [B, C]
+@group(0) @binding(1) var<storage, read>       ce_targets:    array<scalar>;  // [B] (class indices as f32)
+@group(0) @binding(2) var<storage, read_write> ce_grad:       array<scalar>;  // [B, C]
+@group(0) @binding(3) var<storage, read_write> ce_loss_per_b: array<scalar>;  // [B]
 @group(0) @binding(4) var<uniform>             ce_params:     CrossEntropyParams;
 
-var<workgroup> shared_val: array<f32, 64>;
+var<workgroup> shared_val: array<scalar, 64>;
 
 // Each workgroup handles one batch element.
 // gid.x = batch index, local_id.x = thread within workgroup.
@@ -43,7 +43,7 @@ fn cross_entropy_forward_kernel(
     let row_start = b * C;
 
     // ---- Step 1: Find max logit (reduction) ----
-    var local_max: f32 = -3.402823e+38;
+    var local_max: scalar = scalar(-3.402823e+38);
     var c = tid;
     while (c < C) {
         local_max = max(local_max, ce_logits[row_start + c]);
@@ -65,7 +65,7 @@ fn cross_entropy_forward_kernel(
     workgroupBarrier();
 
     // ---- Step 2: Compute sum of exp(z - max) ----
-    var local_sum: f32 = 0.0;
+    var local_sum: scalar = scalar(0.0);
     c = tid;
     while (c < C) {
         local_sum += exp(ce_logits[row_start + c] - max_z);
@@ -89,12 +89,12 @@ fn cross_entropy_forward_kernel(
     if (tid == 0u) {
         let target_class = u32(ce_targets[b]);
         let log_sum_exp = max_z + log(sum_exp);
-        ce_loss_per_b[b] = (-ce_logits[row_start + target_class] + log_sum_exp) / f32(B);
+        ce_loss_per_b[b] = (-ce_logits[row_start + target_class] + log_sum_exp) / scalar(B);
     }
 
     // ---- Step 4: Write gradient: softmax - one_hot, scaled by 1/B ----
     let target_class = u32(ce_targets[b]);
-    let inv_b = 1.0 / f32(B);
+    let inv_b = 1.0 / scalar(B);
     c = tid;
     while (c < C) {
         let softmax_c = exp(ce_logits[row_start + c] - max_z) / sum_exp;
@@ -114,18 +114,18 @@ struct ReduceParams {
 }
 // 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       reduce_input:  array<f32>;  // [B]
-@group(0) @binding(1) var<storage, read_write> reduce_output: array<f32>;  // [1]
+@group(0) @binding(0) var<storage, read>       reduce_input:  array<scalar>;  // [B]
+@group(0) @binding(1) var<storage, read_write> reduce_output: array<scalar>;  // [1]
 @group(0) @binding(2) var<uniform>             reduce_params: ReduceParams;
 
-var<workgroup> reduce_shared: array<f32, 64>;
+var<workgroup> reduce_shared: array<scalar, 64>;
 
 @compute @workgroup_size(64)
 fn reduce_loss_kernel(
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let tid = lid.x;
-    var local_sum: f32 = 0.0;
+    var local_sum: scalar = scalar(0.0);
     var i = tid;
     while (i < reduce_params.numel) {
         local_sum += reduce_input[i];

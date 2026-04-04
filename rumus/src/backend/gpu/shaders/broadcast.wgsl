@@ -33,9 +33,9 @@ fn get_val(lo: vec4<u32>, hi: vec4<u32>, idx: u32) -> u32 {
     }
 }
 
-@group(0) @binding(0) var<storage, read>       bc_a:      array<f32>;
-@group(0) @binding(1) var<storage, read>       bc_b:      array<f32>;
-@group(0) @binding(2) var<storage, read_write> bc_out:    array<f32>;
+@group(0) @binding(0) var<storage, read>       bc_a:      array<scalar>;
+@group(0) @binding(1) var<storage, read>       bc_b:      array<scalar>;
+@group(0) @binding(2) var<storage, read_write> bc_out:    array<scalar>;
 @group(0) @binding(3) var<uniform>             bc_params: BroadcastBinaryParams;
 
 fn compute_indices(i: u32) -> vec2<u32> {
@@ -97,8 +97,8 @@ struct ReduceSumParams {
 }
 // 16 + 16*7 = 128 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       rs_input:  array<f32>;
-@group(0) @binding(1) var<storage, read_write> rs_output: array<f32>;
+@group(0) @binding(0) var<storage, read>       rs_input:  array<scalar>;
+@group(0) @binding(1) var<storage, read_write> rs_output: array<scalar>;
 @group(0) @binding(2) var<uniform>             rs_params: ReduceSumParams;
 
 @compute @workgroup_size(64)
@@ -137,7 +137,7 @@ fn reduce_sum_kernel(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Actually, let's just iterate over the reduced dims.
 
     // For each reduction combo, compute the full input index.
-    var sum_val: f32 = 0.0;
+    var sum_val: scalar = scalar(0.0);
     for (var r: u32 = 0u; r < total_reduce; r++) {
         // Decompose out_idx into kept-dim coords, r into reduced-dim coords.
         var in_idx: u32 = 0u;

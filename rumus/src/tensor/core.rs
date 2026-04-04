@@ -52,6 +52,37 @@ pub struct OpId(pub usize);
 pub struct ParamId(pub usize);
 
 // ---------------------------------------------------------------------------
+// DType — element type tag
+// ---------------------------------------------------------------------------
+
+/// Element data type for tensor storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DType {
+    F32,
+    F16,
+}
+
+impl DType {
+    /// Size in bytes of a single element.
+    pub fn byte_size(self) -> usize {
+        match self {
+            DType::F32 => 4,
+            DType::F16 => 2,
+        }
+    }
+
+    /// Compute the GPU buffer byte size for `numel` elements, aligned to
+    /// WebGPU's `COPY_BUFFER_ALIGNMENT` (4 bytes).
+    ///
+    /// F32: `numel * 4` (always aligned).
+    /// F16: `(numel * 2 + 3) & !3` (round up to next 4-byte boundary).
+    pub fn gpu_buf_size(self, numel: usize) -> u64 {
+        let raw = numel * self.byte_size();
+        ((raw + 3) & !3) as u64
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Storage layer
 // ---------------------------------------------------------------------------
 
@@ -149,6 +180,8 @@ pub struct StorageInner {
     data: RwLock<StorageData>,
     /// Element count.  Immutable after construction.
     len: usize,
+    /// Element data type.  Immutable after construction.
+    dtype: DType,
     /// Monotonically increasing mutation counter for autograd version checking.
     version: AtomicUsize,
     /// Per-resource WGPU fence (AtomicUsize with `usize::MAX` sentinel).
@@ -210,13 +243,14 @@ pub struct StorageHandle {
 }
 
 impl StorageHandle {
-    /// Allocate new CPU storage owning the given `data` buffer.
+    /// Allocate new CPU storage owning the given `data` buffer (F32).
     pub fn new(data: Vec<f32>) -> Self {
         let len = data.len();
         Self {
             inner: Arc::new(StorageInner {
                 data: RwLock::new(StorageData::Cpu(data)),
                 len,
+                dtype: DType::F32,
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
             }),
@@ -230,15 +264,35 @@ impl StorageHandle {
             inner: Arc::new(StorageInner {
                 data: RwLock::new(StorageData::Gpu { buffer, len }),
                 len,
+                dtype: DType::F32,
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
             }),
         }
     }
 
-    /// Number of f32 elements in this storage.
+    /// Create GPU-resident F16 storage wrapping a `wgpu::Buffer`.
+    #[cfg(feature = "gpu")]
+    pub fn new_gpu_f16(buffer: wgpu::Buffer, len: usize) -> Self {
+        Self {
+            inner: Arc::new(StorageInner {
+                data: RwLock::new(StorageData::Gpu { buffer, len }),
+                len,
+                dtype: DType::F16,
+                version: AtomicUsize::new(0),
+                fence: AtomicUsize::new(NO_FENCE),
+            }),
+        }
+    }
+
+    /// Number of elements in this storage.
     pub fn len(&self) -> usize {
         self.inner.len
+    }
+
+    /// Element data type.
+    pub fn dtype(&self) -> DType {
+        self.inner.dtype
     }
 
     /// Returns `true` if the data is (at least partially) on the GPU.
@@ -301,9 +355,24 @@ impl StorageHandle {
     /// Returns a [`DataReadGuard`] that derefs to `&[f32]`.
     /// If the data is GPU-only (feature `gpu`), triggers a blocking
     /// device-to-host transfer first.
+    ///
+    /// **F16 tensors:** If this storage is `DType::F16`, the data is
+    /// cast to F32 on the GPU, downloaded, and the CPU mirror replaced.
+    /// This enables inspection/printing of F16 tensors without panicking.
     pub fn data(&self) -> DataReadGuard<'_> {
         #[cfg(feature = "gpu")]
-        self.ensure_cpu();
+        if self.inner.dtype == DType::F16 {
+            // F16 GPU data must be cast to F32 before CPU access.
+            // We do this by creating a temporary F32 buffer on the GPU,
+            // dispatching the cast kernel, downloading, and replacing
+            // the CPU mirror.
+            self.ensure_cpu_f16_as_f32();
+        } else {
+            self.ensure_cpu();
+        }
+
+        #[cfg(not(feature = "gpu"))]
+        assert_eq!(self.inner.dtype, DType::F32, "F16 tensors require GPU feature");
 
         parking_lot::RwLockReadGuard::map(self.inner.data.read(), |sd| match sd {
             StorageData::Cpu(v) => v.as_slice(),
@@ -316,6 +385,87 @@ impl StorageHandle {
                 panic!("cannot read tensor data while a device transfer is in progress")
             }
         })
+    }
+
+    /// For F16 GPU tensors: cast to F32 on GPU, download as Vec<f32>.
+    /// Stores the result as a CPU F32 mirror so data() can return &[f32].
+    #[cfg(feature = "gpu")]
+    fn ensure_cpu_f16_as_f32(&self) {
+        // Fast path: already has a CPU mirror.
+        {
+            let guard = self.inner.data.read();
+            match &*guard {
+                StorageData::Cpu(_) => return,
+                StorageData::Both {
+                    dirty: DirtySide::Clean | DirtySide::Cpu,
+                    ..
+                } => return,
+                _ => {}
+            }
+        }
+
+        // Need to cast F16 → F32 on GPU, then download.
+        let ctx = crate::backend::gpu::context::GpuContext::get()
+            .expect("GPU context required for F16→F32 cast");
+
+        // Extract the GPU buffer.
+        let extracted = {
+            let mut guard = self.inner.data.write();
+            match &*guard {
+                StorageData::Cpu(_) => return,
+                StorageData::Both {
+                    dirty: DirtySide::Clean | DirtySide::Cpu,
+                    ..
+                } => return,
+                _ => {}
+            }
+            std::mem::replace(&mut *guard, StorageData::Transferring)
+        };
+
+        let new_state = match extracted {
+            StorageData::Gpu { buffer, len } => {
+                let f32_buf = ctx.pool.acquire(
+                    &ctx.device,
+                    (len * 4) as u64,
+                    crate::backend::gpu::context::STORAGE_USAGE,
+                );
+                crate::backend::gpu::compute::cast_f16_to_f32_dispatch(
+                    ctx, &buffer, &f32_buf, len as u32,
+                );
+                let cpu_data = ctx.download(&f32_buf, len);
+                ctx.pool.release(f32_buf);
+                StorageData::Both {
+                    cpu: cpu_data,
+                    gpu: buffer,
+                    dirty: DirtySide::Clean,
+                }
+            }
+            StorageData::Both {
+                gpu,
+                dirty: DirtySide::Gpu,
+                ..
+            } => {
+                let len = self.inner.len;
+                let f32_buf = ctx.pool.acquire(
+                    &ctx.device,
+                    (len * 4) as u64,
+                    crate::backend::gpu::context::STORAGE_USAGE,
+                );
+                crate::backend::gpu::compute::cast_f16_to_f32_dispatch(
+                    ctx, &gpu, &f32_buf, len as u32,
+                );
+                let cpu_data = ctx.download(&f32_buf, len);
+                ctx.pool.release(f32_buf);
+                StorageData::Both {
+                    cpu: cpu_data,
+                    gpu,
+                    dirty: DirtySide::Clean,
+                }
+            }
+            other => other,
+        };
+
+        *self.inner.data.write() = new_state;
     }
 
     /// Acquire an exclusive **write** lock on the CPU data.
@@ -727,6 +877,7 @@ impl Tensor {
     pub fn ndim(&self) -> usize { self.layout.ndim() }
     pub fn numel(&self) -> usize { self.layout.numel() }
     pub fn is_contiguous(&self) -> bool { self.layout.is_contiguous() }
+    pub fn dtype(&self) -> DType { self.storage.dtype() }
 
     pub fn requires_grad(&self) -> bool {
         match &self.state {

@@ -30,6 +30,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M8d — Transformer Block** | Complete |
 | **M9 — The Vision Stack** | Complete |
 | **M10 — Training Ergonomics** | Complete |
+| **M11 — FP16 Mixed Precision** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -167,6 +168,24 @@ global L2 norm; Pass 3: scale via `broadcast_scale` if norm exceeds `max_norm`.
 `GradientStore::replace()` swaps gradient tensors without WebGPU buffer aliasing.
 Zero new external dependencies.
 
+**M11 — FP16 Mixed Precision (Complete):** `DType` enum (`F32`, `F16`) with
+`gpu_buf_size(numel)` for 4-byte-aligned buffer allocation. `dtype` tracked on
+`StorageInner` (immutable after construction), `Tensor::dtype()` derived from
+storage. `GpuContext` requests `wgpu::Features::SHADER_F16` at init, stores
+`supports_f16` flag. WGSL shader metaprogramming via `preprocess_shader()`:
+prepends `alias scalar = f32;` or `enable f16; alias scalar = f16;` — all 23
+data-path shaders refactored to use `scalar` type alias for data buffers,
+accumulators, and workgroup shared memory, with uniform reads explicitly cast
+via `scalar(params.field)`. `F16Pipelines` struct with 30 compute pipelines
+compiled conditionally when hardware supports `shader-f16`. `cast.wgsl` with
+`cast_f32_to_f16_kernel` / `cast_f16_to_f32_kernel` using concrete types.
+`Tensor::to_dtype(target)` tracked op with `CastBackward` (gradient = reverse
+cast). `data()` on F16 tensors dynamically casts to F32 on GPU before download
+(no panics on inspect). All optimizers auto-cast F16 gradients to F32 before
+master weight update. All hardcoded `* 4` buffer allocations replaced with
+`DType::gpu_buf_size()`. `BackwardOp` enum now has 31 variants. Zero new
+external dependencies.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -185,9 +204,10 @@ Zero new external dependencies.
 | Struct | Role |
 |--------|------|
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
+| `DType` | `F32` / `F16` enum with `byte_size()` and `gpu_buf_size(numel)` (4-byte aligned) |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
-| `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool` |
-| `PipelineCache` | Named struct fields for 35+ compute pipelines + 10 bind group layouts (no HashMap) |
+| `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool`, `supports_f16` |
+| `PipelineCache` | Named struct fields for 35+ F32 pipelines + `Option<F16Pipelines>` (30 F16 variants) + cast pipelines |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
@@ -198,7 +218,7 @@ Zero new external dependencies.
 | `Backend` trait | Stateless associated fns (no `&self`) — `CpuBackend` is zero-sized |
 | `Tape` | Append-only Wengert list of `TapeEntry` nodes |
 | `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked, `replace()` for clip |
-| `BackwardOp` | Concrete enum (30 variants) — no closures, `Send + Sync` |
+| `BackwardOp` | Concrete enum (31 variants incl. `Cast`) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
 | `Module` trait | State-only: `parameters`, `train`/`eval`, `state_dict`/`load_state_dict` — `forward` is inherent |
 | `#[derive(Module)]` | Proc macro generating all `Module` methods by iterating struct fields |
@@ -228,6 +248,8 @@ Zero new external dependencies.
 | `StepLR` | Step-decay scheduler: `lr *= gamma` every `step_size` epochs |
 | `CosineAnnealingLR` | Cosine annealing from `initial_lr` to `eta_min` over `t_max` epochs |
 | `clip_grad_norm_` | 3-pass GPU-safe gradient clipping: reduce_sum_sq → read norms → scale |
+| `Tensor::to_dtype()` | GPU cast `F32↔F16` via WGSL kernels, tracked with `CastBackward` |
+| `preprocess_shader()` | WGSL metaprogramming: `alias scalar = f32/f16` injection for dual F32/F16 pipelines |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine

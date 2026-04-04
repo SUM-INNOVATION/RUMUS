@@ -15,11 +15,11 @@ struct SoftmaxParams {
 }
 // 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       sm_input:  array<f32>;
-@group(0) @binding(1) var<storage, read_write> sm_output: array<f32>;
+@group(0) @binding(0) var<storage, read>       sm_input:  array<scalar>;
+@group(0) @binding(1) var<storage, read_write> sm_output: array<scalar>;
 @group(0) @binding(2) var<uniform>             sm_params: SoftmaxParams;
 
-var<workgroup> shared_val: array<f32, 64>;
+var<workgroup> shared_val: array<scalar, 64>;
 
 @compute @workgroup_size(64)
 fn softmax_forward_kernel(
@@ -33,7 +33,7 @@ fn softmax_forward_kernel(
     let base = row * D;
 
     // Phase 1: max
-    var local_max: f32 = -3.402823e+38;
+    var local_max: scalar = scalar(-3.402823e+38);
     var j = tid;
     while (j < D) {
         local_max = max(local_max, sm_input[base + j]);
@@ -51,7 +51,7 @@ fn softmax_forward_kernel(
     workgroupBarrier();
 
     // Phase 2: sum of exp
-    var local_sum: f32 = 0.0;
+    var local_sum: scalar = scalar(0.0);
     j = tid;
     while (j < D) {
         local_sum += exp(sm_input[base + j] - max_val);

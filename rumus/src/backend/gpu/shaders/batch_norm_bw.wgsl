@@ -10,15 +10,15 @@ struct BatchNormBwParams {
 }
 // 16 bytes ✓
 
-@group(0) @binding(0) var<storage, read>       bnbw_grad_out: array<f32>;
-@group(0) @binding(1) var<storage, read>       bnbw_input:    array<f32>;
-@group(0) @binding(2) var<storage, read>       bnbw_weight:   array<f32>;
-@group(0) @binding(3) var<storage, read>       bnbw_save:     array<f32>;
-@group(0) @binding(4) var<storage, read_write> bnbw_grad_in:  array<f32>;
+@group(0) @binding(0) var<storage, read>       bnbw_grad_out: array<scalar>;
+@group(0) @binding(1) var<storage, read>       bnbw_input:    array<scalar>;
+@group(0) @binding(2) var<storage, read>       bnbw_weight:   array<scalar>;
+@group(0) @binding(3) var<storage, read>       bnbw_save:     array<scalar>;
+@group(0) @binding(4) var<storage, read_write> bnbw_grad_in:  array<scalar>;
 @group(0) @binding(5) var<uniform>             bnbw_params:   BatchNormBwParams;
 
-var<workgroup> shared_c1: array<f32, 64>;
-var<workgroup> shared_c2: array<f32, 64>;
+var<workgroup> shared_c1: array<scalar, 64>;
+var<workgroup> shared_c2: array<scalar, 64>;
 
 @compute @workgroup_size(64)
 fn batch_norm_backward_kernel(
@@ -35,8 +35,8 @@ fn batch_norm_backward_kernel(
     let gamma = bnbw_weight[c];
 
     // Reductions: c1 = (1/N) Σ grad_norm, c2 = (1/N) Σ grad_norm * x_hat
-    var lc1: f32 = 0.0;
-    var lc2: f32 = 0.0;
+    var lc1: scalar = scalar(0.0);
+    var lc2: scalar = scalar(0.0);
     var idx = tid;
     while (idx < n) {
         let b = idx / spatial;
@@ -60,8 +60,8 @@ fn batch_norm_backward_kernel(
         workgroupBarrier();
         s = s >> 1u;
     }
-    let c1 = shared_c1[0] / f32(n);
-    let c2 = shared_c2[0] / f32(n);
+    let c1 = shared_c1[0] / scalar(n);
+    let c2 = shared_c2[0] / scalar(n);
     workgroupBarrier();
 
     // Element-wise grad_input
