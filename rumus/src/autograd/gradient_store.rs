@@ -94,4 +94,13 @@ impl GradientStore {
     pub fn len(&self) -> usize {
         self.grads.len()
     }
+
+    /// Replace the gradient for `id` with a new tensor.
+    ///
+    /// Used by `clip_grad_norm_` to swap in scaled gradient tensors
+    /// without WebGPU buffer aliasing issues.  The old tensor is dropped,
+    /// returning its GPU buffer to the pool.
+    pub fn replace(&mut self, id: GradId, grad: Tensor) {
+        self.grads.insert(id, grad);
+    }
 }

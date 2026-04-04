@@ -7,10 +7,14 @@
 
 mod adam;
 mod adamw;
+pub mod clip;
 mod sgd;
+pub mod scheduler;
 
 pub use adam::Adam;
 pub use adamw::AdamW;
+pub use clip::clip_grad_norm_;
+pub use scheduler::{CosineAnnealingLR, LRScheduler, StepLR};
 pub use sgd::SGD;
 
 use crate::autograd::{AutogradError, GradientStore};
@@ -35,4 +39,10 @@ pub trait Optimizer {
     /// For SGD without momentum this is a no-op.  For Adam it can
     /// optionally reset the moment estimates (rarely used in practice).
     fn zero_grad(&mut self) {}
+
+    /// Set the learning rate.
+    fn set_lr(&mut self, lr: f32);
+
+    /// Get the current learning rate.
+    fn get_lr(&self) -> f32;
 }

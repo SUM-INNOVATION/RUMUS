@@ -104,6 +104,9 @@ pub struct PipelineCache {
     pub col2im_pipeline: wgpu::ComputePipeline,
     pub add_channel_bias_pipeline: wgpu::ComputePipeline,
     pub sum_channel_bias_grad_pipeline: wgpu::ComputePipeline,
+
+    // Gradient clipping: reduce sum of squares (reuses unary_layout)
+    pub reduce_sum_sq_pipeline: wgpu::ComputePipeline,
 }
 
 impl PipelineCache {
@@ -324,6 +327,13 @@ impl PipelineCache {
             ),
         });
 
+        let reduce_sum_sq_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("reduce_sum_sq"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/reduce_sum_sq.wgsl").into(),
+            ),
+        });
+
         // SGD: grad(read) + vel(rw) + param(rw) + uniform
         let sgd_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sgd_layout"),
@@ -474,6 +484,7 @@ impl PipelineCache {
         let fused_dropout_pipeline = make_pipeline(&pool_layout, &fused_dropout_module, "fused_dropout_kernel", "fused_dropout");
         let max_pool2d_pipeline = make_pipeline(&pool_layout, &pool_module, "max_pool2d_kernel", "max_pool2d");
         let max_pool2d_bw_pipeline = make_pipeline(&pool_bw_layout, &pool_module, "max_pool2d_backward_kernel", "max_pool2d_bw");
+        let reduce_sum_sq_pipeline = make_pipeline(&unary_layout, &reduce_sum_sq_module, "reduce_sum_sq_kernel", "reduce_sum_sq");
 
         Self {
             binary_layout, add_pipeline, sub_pipeline, mul_pipeline, relu_bw_pipeline,
@@ -500,6 +511,7 @@ impl PipelineCache {
             pool_bw_layout, max_pool2d_bw_pipeline,
             im2col_pipeline, col2im_pipeline,
             add_channel_bias_pipeline, sum_channel_bias_grad_pipeline,
+            reduce_sum_sq_pipeline,
         }
     }
 }

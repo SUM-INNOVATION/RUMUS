@@ -155,6 +155,14 @@ impl Optimizer for AdamW {
 
         Ok(())
     }
+
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+
+    fn get_lr(&self) -> f32 {
+        self.lr
+    }
 }
 
 /// Allocate a GPU-native zeroed tensor — strictly on-device.

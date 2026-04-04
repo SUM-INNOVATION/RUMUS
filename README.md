@@ -29,6 +29,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M8c — BMM, Softmax & SDPA** | Complete |
 | **M8d — Transformer Block** | Complete |
 | **M9 — The Vision Stack** | Complete |
+| **M10 — Training Ergonomics** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -150,6 +151,22 @@ WGSL `adaptive_pool.wgsl` kernel (forward + backward). All three modules
 implement `Module` trait with state_dict support. `BackwardOp` enum now has 30
 variants.
 
+**M10 — Training Ergonomics (Complete):** `data::Dataset` trait and
+`data::DataLoader` with multithreaded prefetching via bounded `mpsc` channels.
+Worker threads fetch and collate batches in the background; channel capacity
+`prefetch_factor * num_workers` prevents OOM. Deadlock-free teardown: `Drop`
+drops `batch_rx` (via `Option::take`) before joining workers, ensuring blocked
+`send()` calls wake with `Err`. Feeder thread explicitly joined. Fisher-Yates
+shuffle with zero-dep LCG. Learning rate schedulers: `LRScheduler` trait with
+`StepLR` (step decay) and `CosineAnnealingLR` (smooth cosine annealing with
+`eta_min`). `Optimizer` trait extended with `set_lr()`/`get_lr()` on SGD, Adam,
+AdamW. Gradient clipping: `clip_grad_norm_` with 3-pass non-stalling GPU
+strategy — Pass 1: dispatch `reduce_sum_sq` WGSL kernel for all GPU gradients;
+Pass 2: read back per-parameter squared norms (single sync point), compute
+global L2 norm; Pass 3: scale via `broadcast_scale` if norm exceeds `max_norm`.
+`GradientStore::replace()` swaps gradient tensors without WebGPU buffer aliasing.
+Zero new external dependencies.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -180,12 +197,12 @@ variants.
 | `Parameter` | `Tensor` + globally unique `ParamId` (auto `requires_grad`), implements `Module` |
 | `Backend` trait | Stateless associated fns (no `&self`) — `CpuBackend` is zero-sized |
 | `Tape` | Append-only Wengert list of `TapeEntry` nodes |
-| `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked |
+| `GradientStore` | `HashMap<GradId, Tensor>` — accumulate-only, shape-checked, `replace()` for clip |
 | `BackwardOp` | Concrete enum (30 variants) — no closures, `Send + Sync` |
 | `VersionSnapshot` | `WeakStorageHandle` + recorded version — upgrade-or-dead check |
 | `Module` trait | State-only: `parameters`, `train`/`eval`, `state_dict`/`load_state_dict` — `forward` is inherent |
 | `#[derive(Module)]` | Proc macro generating all `Module` methods by iterating struct fields |
-| `Optimizer` trait | `step(&mut self, &mut GradientStore)` — drain pattern |
+| `Optimizer` trait | `step(&mut self, &mut GradientStore)` + `set_lr`/`get_lr` — drain pattern |
 | `SGD` | CPU: block-scoped `RwLock` guards. GPU: fused `sgd_step` WGSL kernel |
 | `Adam` | CPU: block-scoped locks. GPU: fused `adam_step` WGSL kernel (m + v + param in one dispatch) |
 | `Tensor::to_gpu()` | Triggers H2D transfer; `ModuleToGpu` blanket trait pushes all params |
@@ -206,6 +223,11 @@ variants.
 | `ConvTranspose2d` | Transposed convolution via `W^T @ x → col2im`, composition of tracked ops |
 | `AdaptiveAvgPool2d` | Dynamic-bin average pooling to fixed output size, WGSL forward/backward |
 | `Trainer<O>` | Closure-based `train_step()`, epoch loss tracking, no `zero_grad` needed |
+| `Dataset` trait | `len()` + `get(index)` → `DataItem`, `Send + Sync` for worker threads |
+| `DataLoader` | Multithreaded batching with bounded `mpsc` channels, Fisher-Yates shuffle, deadlock-free `Drop` |
+| `StepLR` | Step-decay scheduler: `lr *= gamma` every `step_size` epochs |
+| `CosineAnnealingLR` | Cosine annealing from `initial_lr` to `eta_min` over `t_max` epochs |
+| `clip_grad_norm_` | 3-pass GPU-safe gradient clipping: reduce_sum_sq → read norms → scale |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine

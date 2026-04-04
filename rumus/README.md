@@ -10,7 +10,8 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 | `autograd` | Thread-local `Tape`, `GradientStore`, Kahn's algorithm backward engine, `no_grad()` RAII guard, `VersionSnapshot` with `Weak` references, 30 concrete `BackwardOp` variants |
 | `backend` | `Backend` trait (CPU) + feature-gated `gpu` module: `GpuContext` singleton, `BufferPool`, `PipelineCache` (35+ WGSL compute pipelines), and all GPU dispatch functions |
 | `nn` | `Parameter`, `Module` trait, `#[derive(Module)]` (re-exported from `rumus-macros`), `Linear`, `Conv2d`, `ConvTranspose2d`, `MaxPool2d`, `AdaptiveAvgPool2d`, `Flatten`, `Dropout`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `MultiheadAttention`, `TransformerBlock`, activations (`relu`, `sigmoid`, `tanh`, `gelu`, `leaky_relu`), `mse_loss`, `cross_entropy_loss`, safetensors IO |
-| `optim` | `Optimizer` trait, `SGD`, `Adam`, `AdamW` — all with CPU + GPU dual-path dispatch |
+| `optim` | `Optimizer` trait (`step` + `set_lr`/`get_lr`), `SGD`, `Adam`, `AdamW` — all with CPU + GPU dual-path dispatch. `LRScheduler` trait with `StepLR` and `CosineAnnealingLR`. `clip_grad_norm_` with 3-pass non-stalling GPU strategy |
+| `data` | `Dataset` trait, `DataItem`, `DataLoader` with multithreaded prefetching (`std::thread` + bounded `mpsc`), Fisher-Yates shuffle, deadlock-free `Drop` teardown |
 | `train` | `Trainer<O: Optimizer>` — closure-based `train_step()` orchestrator |
 
 ## Features

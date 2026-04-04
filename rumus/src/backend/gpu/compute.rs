@@ -1786,3 +1786,44 @@ pub(crate) fn adaptive_avg_pool2d_backward(
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
 }
+
+// ---------------------------------------------------------------------------
+// Gradient clipping: reduce sum of squares
+// ---------------------------------------------------------------------------
+
+/// Compute `output[0] = sum(input[i]^2)` via workgroup shared memory reduction.
+///
+/// Single workgroup dispatch — suited for per-parameter reductions
+/// (up to ~65k elements per launch at workgroup_size=256).
+pub(crate) fn reduce_sum_sq(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    numel: u32,
+) {
+    let params = ReduceParams { numel, _pad0: 0, _pad1: 0, _pad2: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("reduce_sum_sq_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.reduce_sum_sq_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}

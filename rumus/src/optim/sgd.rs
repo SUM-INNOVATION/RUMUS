@@ -111,4 +111,12 @@ impl Optimizer for SGD {
 
         Ok(())
     }
+
+    fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+
+    fn get_lr(&self) -> f32 {
+        self.lr
+    }
 }
