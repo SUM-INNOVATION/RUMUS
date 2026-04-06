@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Data loading pipeline: datasets and batched iterators.
 
 mod dataloader;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Learnable parameter with globally unique identity.
 
 use std::collections::HashMap;

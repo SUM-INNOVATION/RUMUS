@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! 2D convolutional layer via im2col + matmul.
 
 use std::cell::Cell;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Pure-Rust CPU backend — zero external dependencies.
 
 use super::Backend;

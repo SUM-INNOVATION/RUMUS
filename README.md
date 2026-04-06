@@ -31,6 +31,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M9 — The Vision Stack** | Complete |
 | **M10 — Training Ergonomics** | Complete |
 | **M11 — FP16 Mixed Precision** | Complete |
+| **M12 — INT8 Quantization Engine** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -186,6 +187,22 @@ master weight update. All hardcoded `* 4` buffer allocations replaced with
 `DType::gpu_buf_size()`. `BackwardOp` enum now has 31 variants. Zero new
 external dependencies.
 
+**M12 — INT8 Quantization Engine (Complete):** `DType::Q8 { block_size }`
+variant for symmetric block-quantized INT8. Fused GPU buffer layout: 4-byte
+header (f16 scale in lower 16 bits + 2B padding for u32 alignment) followed by
+`block_size` i8 values per block. `gpu_buf_size()` computes
+`num_blocks * (4 + block_size)` with 4-byte alignment. `quantize.wgsl`:
+per-block workgroup reduction for `abs_max`, `pack2x16float` for f16 scale,
+4-i8-per-u32 packing. `dequantize.wgsl`: per-element `unpack2x16float` +
+sign-extended i8 extraction. `matmul_q8.wgsl`: mixed-precision kernel where
+`scalar` activations x Q8 weights -> `scalar` output, dequantizing i8 weights
+in-register via vectorized `unpack_i8x4()` — no intermediate VRAM expansion.
+`Tensor::quantize(block_size)` transposes-then-quantizes to produce column-major
+block order matching the matmul kernel's access pattern. `Tensor::matmul()`
+auto-dispatches `matmul_q8` when rhs is Q8. All quantization ops are untracked
+(PTQ inference-only, `AutogradState::None`). `data()` on Q8 tensors
+dequantizes on GPU before download. Zero new external dependencies.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -204,10 +221,10 @@ external dependencies.
 | Struct | Role |
 |--------|------|
 | `StorageHandle` | `Arc<StorageInner>` wrapping `parking_lot::RwLock<StorageData>` + atomic version counter + fence |
-| `DType` | `F32` / `F16` enum with `byte_size()` and `gpu_buf_size(numel)` (4-byte aligned) |
+| `DType` | `F32` / `F16` / `Q8 { block_size }` enum with `gpu_buf_size(numel)` (4-byte aligned) |
 | `StorageData` | Enum: `Cpu(Vec<f32>)`, `Gpu(wgpu::Buffer)`, `Both { cpu, gpu, dirty }`, `Transferring` |
 | `GpuContext` | `OnceLock<Option<...>>` singleton holding `Device`, `Queue`, `PipelineCache`, `BufferPool`, `supports_f16` |
-| `PipelineCache` | Named struct fields for 35+ F32 pipelines + `Option<F16Pipelines>` (30 F16 variants) + cast pipelines |
+| `PipelineCache` | Named struct fields for 35+ F32 pipelines + `Option<F16Pipelines>` (30 F16 variants) + cast + Q8 pipelines |
 | `BufferPool` | Power-of-2 bucketed GPU buffer cache (`Mutex<HashMap<PoolKey, Vec<Buffer>>>`) |
 | `WeakStorageHandle` | Non-owning ref for `VersionSnapshot` (dead tensor = provably unmutated) |
 | `Layout` | Shape, strides, offset — views share storage with different layouts |
@@ -250,6 +267,8 @@ external dependencies.
 | `clip_grad_norm_` | 3-pass GPU-safe gradient clipping: reduce_sum_sq → read norms → scale |
 | `Tensor::to_dtype()` | GPU cast `F32↔F16` via WGSL kernels, tracked with `CastBackward` |
 | `preprocess_shader()` | WGSL metaprogramming: `alias scalar = f32/f16` injection for dual F32/F16 pipelines |
+| `Tensor::quantize()` | Symmetric block INT8 quantization with column-major repacking for matmul locality |
+| `matmul_q8` | Mixed-precision WGSL kernel: scalar A x Q8 B -> scalar C, in-register dequantization |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
@@ -283,4 +302,13 @@ GPU-only (behind `--features gpu`): `wgpu` + `pollster`.
 
 ## License
 
-TBD
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you, as defined in the Apache-2.0 license,
+shall be dual licensed as above, without any additional terms or conditions.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Stochastic Gradient Descent with optional momentum.
 //!
 //! When parameters are GPU-resident, dispatches a WGSL kernel —

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Thread-safe GPU buffer pool.
 //!
 //! Caches and reuses `wgpu::Buffer` allocations, keyed by size (rounded

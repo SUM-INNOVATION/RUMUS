@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Process-global GPU device context with pre-compiled pipeline cache.
 
 use std::sync::OnceLock;
@@ -111,6 +112,14 @@ pub struct PipelineCache {
     // Cast kernels (f32↔f16, only compiled when supports_f16)
     pub cast_f32_to_f16_pipeline: Option<wgpu::ComputePipeline>,
     pub cast_f16_to_f32_pipeline: Option<wgpu::ComputePipeline>,
+
+    // INT8 quantization (reuses unary_layout for quantize/dequantize)
+    pub quantize_pipeline: wgpu::ComputePipeline,
+    pub dequantize_pipeline: wgpu::ComputePipeline,
+
+    // Mixed-precision matmul: scalar A × Q8 B → scalar C
+    pub q8_matmul_layout: wgpu::BindGroupLayout,
+    pub matmul_q8_pipeline: wgpu::ComputePipeline,
 
     // F16 pipeline variants (None if GPU doesn't support shader-f16)
     pub f16: Option<F16Pipelines>,
@@ -472,6 +481,27 @@ impl PipelineCache {
         let max_pool2d_bw_pipeline = make_pipeline(&pool_bw_layout, &pool_module, "max_pool2d_backward_kernel", "max_pool2d_bw");
         let reduce_sum_sq_pipeline = make_pipeline(&unary_layout, &reduce_sum_sq_module, "reduce_sum_sq_kernel", "reduce_sum_sq");
 
+        // ---- INT8 Quantization pipelines -----------------------------------
+
+        let quantize_module = make_module(device, "quantize", include_str!("shaders/quantize.wgsl"), DType::F32);
+        let dequantize_module = make_module(device, "dequantize", include_str!("shaders/dequantize.wgsl"), DType::F32);
+        let matmul_q8_module = make_module(device, "matmul_q8", include_str!("shaders/matmul_q8.wgsl"), DType::F32);
+
+        let quantize_pipeline = make_pipeline(&unary_layout, &quantize_module, "quantize_kernel", "quantize");
+        let dequantize_pipeline = make_pipeline(&unary_layout, &dequantize_module, "dequantize_kernel", "dequantize");
+
+        // Q8 matmul layout: A(scalar read) + B(u32 read) + C(scalar rw) + uniform
+        let q8_matmul_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("q8_matmul_layout"),
+            entries: &[
+                bgl_storage(0, true),   // A: activations
+                bgl_storage(1, true),   // B: packed Q8 weights
+                bgl_storage_rw(2),      // C: output
+                bgl_uniform(3),
+            ],
+        });
+        let matmul_q8_pipeline = make_pipeline(&q8_matmul_layout, &matmul_q8_module, "matmul_q8_kernel", "matmul_q8");
+
         // ---- Cast and F16 pipelines (conditional) ------------------------------
 
         let (cast_f32_to_f16_pipeline, cast_f16_to_f32_pipeline, f16_pipelines) = if supports_f16 {
@@ -561,6 +591,10 @@ impl PipelineCache {
             im2col_pipeline, col2im_pipeline,
             add_channel_bias_pipeline, sum_channel_bias_grad_pipeline,
             reduce_sum_sq_pipeline,
+            quantize_pipeline,
+            dequantize_pipeline,
+            q8_matmul_layout,
+            matmul_q8_pipeline,
             cast_f32_to_f16_pipeline,
             cast_f16_to_f32_pipeline,
             f16: f16_pipelines,
@@ -618,7 +652,9 @@ pub struct GpuContext {
 /// - `F16`: `enable f16;\nalias scalar = f16;\n`
 pub fn preprocess_shader(source: &str, dtype: crate::tensor::DType) -> String {
     match dtype {
-        crate::tensor::DType::F32 => format!("alias scalar = f32;\n{}", source),
+        crate::tensor::DType::F32 | crate::tensor::DType::Q8 { .. } => {
+            format!("alias scalar = f32;\n{}", source)
+        }
         crate::tensor::DType::F16 => format!("enable f16;\nalias scalar = f16;\n{}", source),
     }
 }

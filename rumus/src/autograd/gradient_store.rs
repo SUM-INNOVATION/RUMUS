@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Central gradient accumulation buffer.
 //!
 //! Per Tenet #2 ("Op-Driven Autograd"): the [`GradientStore`] is

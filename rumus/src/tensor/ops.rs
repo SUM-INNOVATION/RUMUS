@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! View operations (zero-copy) and materialising operations (allocating)
 //! on [`Tensor`].
 //!
@@ -469,16 +470,39 @@ impl Tensor {
     pub fn matmul(&self, rhs: &Tensor) -> Tensor {
         assert_eq!(self.ndim(), 2, "matmul: lhs must be 2-D, got {}-D", self.ndim());
         assert_eq!(rhs.ndim(), 2, "matmul: rhs must be 2-D, got {}-D", rhs.ndim());
+        assert!(!self.dtype().is_quantized(), "matmul: Q8 activations (lhs) not supported");
         let m = self.shape()[0];
         let k = self.shape()[1];
         let n = rhs.shape()[1];
         assert_eq!(k, rhs.shape()[0], "matmul: inner dimension mismatch");
 
+        // Q8 rhs: dispatch mixed-precision matmul (untracked, inference only).
+        #[cfg(feature = "gpu")]
+        if let crate::tensor::DType::Q8 { block_size } = rhs.dtype() {
+            let ctx = GpuContext::get().expect("GPU required for Q8 matmul");
+            let lhs_c = self.contiguous();
+            let lb = lhs_c.storage.gpu_buffer();
+            let rb = rhs.storage.gpu_buffer(); // Q8 buffer, no contiguous() needed
+            let dst = ctx.pool.acquire(&ctx.device, self.dtype().gpu_buf_size(m * n), STORAGE_USAGE);
+            gpu_compute::matmul_q8_dispatch(
+                ctx, &lb, &rb, &dst,
+                m as u32, k as u32, n as u32, block_size as u32,
+            );
+            drop(lb); drop(rb);
+            let out_storage = StorageHandle::new_gpu(dst, m * n);
+            // Q8 matmul is untracked (inference only).
+            return Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(vec![m, n]),
+                state: AutogradState::None,
+            };
+        }
+
         let lhs_c = self.contiguous();
         let rhs_c = rhs.contiguous();
         let result_shape = vec![m, n];
 
-        // Matmul has different dispatch signature — handle inline.
+        // Standard F32/F16 matmul.
         #[cfg(feature = "gpu")]
         let out_storage = if either_gpu(&lhs_c, &rhs_c) {
             let ctx = GpuContext::get().expect("GPU required");
@@ -2157,6 +2181,85 @@ impl Tensor {
         } else {
             Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
         }
+    }
+
+    // === INT8 Quantization =====================================================
+
+    /// Quantize this tensor to symmetric block INT8.
+    ///
+    /// Each block of `block_size` elements gets an independent f16 scale.
+    /// Output is a Q8 tensor backed by a fused buffer (4-byte header + i8 data
+    /// per block).  The tensor must be GPU-resident.
+    ///
+    /// **Untracked** — returns `AutogradState::None`.  This is a post-training
+    /// quantization (PTQ) operation for inference only.
+    pub fn quantize(&self, block_size: usize) -> Tensor {
+        assert!(block_size > 0 && block_size % 4 == 0, "quantize: block_size must be > 0 and divisible by 4");
+        assert!(!self.dtype().is_quantized(), "quantize: input is already quantized");
+        assert!(self.ndim() >= 2, "quantize: tensor must be at least 2-D for column-major repacking");
+
+        let numel = self.numel();
+        let original_shape = self.shape().to_vec();
+        let q8_dtype = crate::tensor::DType::Q8 { block_size };
+
+        #[cfg(feature = "gpu")]
+        {
+            let ctx = GpuContext::get().expect("GPU required for quantization");
+
+            // Transpose last two dims and materialize to get column-major
+            // memory layout.  The flat quantize kernel then naturally produces
+            // per-column blocks — exactly what matmul_q8.wgsl expects.
+            let ndim = self.ndim();
+            let transposed = self.transpose(ndim - 2, ndim - 1).contiguous();
+
+            let tb = transposed.storage.gpu_buffer();
+            let dst = ctx.pool.acquire(&ctx.device, q8_dtype.gpu_buf_size(numel), STORAGE_USAGE);
+            gpu_compute::quantize_dispatch(ctx, &tb, &dst, numel as u32, block_size as u32);
+            drop(tb);
+
+            let out_storage = StorageHandle::new_gpu_q8(dst, numel, block_size);
+            // Return with the ORIGINAL shape [K, N] so it behaves correctly
+            // in the model graph.  The Q8 matmul kernel ignores layout strides
+            // and uses its own packed-block addressing.
+            return Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(original_shape),
+                state: AutogradState::None,
+            };
+        }
+
+        #[cfg(not(feature = "gpu"))]
+        panic!("quantize requires GPU feature");
+    }
+
+    /// Dequantize a Q8 tensor back to F32.
+    ///
+    /// **Untracked** — inference-only operation.
+    pub fn dequantize(&self) -> Tensor {
+        let block_size = match self.dtype() {
+            crate::tensor::DType::Q8 { block_size } => block_size,
+            _ => panic!("dequantize: tensor is not Q8"),
+        };
+        let numel = self.numel();
+        let result_shape = self.shape().to_vec();
+
+        #[cfg(feature = "gpu")]
+        {
+            let ctx = GpuContext::get().expect("GPU required for dequantization");
+            let ib = self.storage.gpu_buffer();
+            let dst = ctx.pool.acquire(&ctx.device, crate::tensor::DType::F32.gpu_buf_size(numel), STORAGE_USAGE);
+            gpu_compute::dequantize_dispatch(ctx, &ib, &dst, numel as u32, block_size as u32);
+            drop(ib);
+            let out_storage = StorageHandle::new_gpu(dst, numel);
+            return Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::None,
+            };
+        }
+
+        #[cfg(not(feature = "gpu"))]
+        panic!("dequantize requires GPU feature");
     }
 
     /// Flatten all dimensions after the first into a single dimension.

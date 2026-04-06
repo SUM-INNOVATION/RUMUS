@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Thread-local autograd state: tape, GradId generator, and `no_grad` guard.
 //!
 //! Each thread owns its own [`Tape`] and id counter — no global locks.

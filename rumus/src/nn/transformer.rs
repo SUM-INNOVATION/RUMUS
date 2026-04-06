@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Pre-Norm Transformer block (GPT-2/3 style).
 
 use std::collections::HashMap;

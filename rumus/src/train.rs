@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Lightweight training loop orchestrator.
 //!
 //! The [`Trainer`] struct wraps an [`Optimizer`] and provides a

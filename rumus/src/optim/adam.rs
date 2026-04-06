@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Adam optimizer (Kingma & Ba, 2014).
 //!
 //! When parameters are GPU-resident, dispatches a fused WGSL kernel that

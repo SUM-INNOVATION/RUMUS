@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Safetensors serialization and deserialization for state dictionaries.
 //!
 //! Uses the industry-standard `safetensors` format for secure, portable

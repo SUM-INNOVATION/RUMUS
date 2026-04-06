@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Flatten layer — reshapes `[batch, ...]` to `[batch, numel]`.
 
 use std::collections::HashMap;

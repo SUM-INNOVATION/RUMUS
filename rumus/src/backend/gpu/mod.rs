@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! WGPU-based GPU backend.
 //!
 //! Provides the [`GpuContext`] device singleton, [`BufferPool`] for

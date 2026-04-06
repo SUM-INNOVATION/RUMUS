@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! AdamW optimizer (decoupled weight decay).
 //!
 //! Weight decay is applied directly to weights before the gradient step,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Fully connected (dense) linear layer.
 
 use std::cell::Cell;

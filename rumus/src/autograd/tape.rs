@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Append-only Wengert list (tape) for recording the computational graph.
 //!
 //! Operations are recorded in forward-execution order via [`Tape::push`].

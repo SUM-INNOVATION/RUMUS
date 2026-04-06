@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Optimizers for updating learnable parameters.
 //!
 //! Per Tenet #4 ("Borrow-Safe Optimizers"): [`Optimizer::step`] takes

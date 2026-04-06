@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Transposed 2D convolution (deconvolution) via matmul + col2im.
 
 use std::cell::Cell;

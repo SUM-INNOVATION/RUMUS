@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Max pooling layer.
 
 use std::collections::HashMap;

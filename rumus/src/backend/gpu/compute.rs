@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! GPU compute dispatch functions.
 //!
 //! Each function retrieves the cached pipeline from [`GpuContext`],
@@ -1904,6 +1905,156 @@ pub(crate) fn cast_f16_to_f32_dispatch(
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups((numel + 255) / 256, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+// ---------------------------------------------------------------------------
+// INT8 Quantization kernels
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct QuantizeParams {
+    numel: u32,
+    block_size: u32,
+    num_blocks: u32,
+    block_stride_u32: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DequantizeParams {
+    numel: u32,
+    block_size: u32,
+    block_stride_u32: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MatmulQ8Params {
+    m: u32,
+    k: u32,
+    n: u32,
+    block_size: u32,
+    block_stride_u32: u32,
+    blocks_per_col: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// Quantize a scalar buffer to Q8 packed format.
+pub(crate) fn quantize_dispatch(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    numel: u32,
+    block_size: u32,
+) {
+    let num_blocks = (numel + block_size - 1) / block_size;
+    let block_stride_u32 = (4 + block_size + 3) / 4;
+    let params = QuantizeParams { numel, block_size, num_blocks, block_stride_u32 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("quantize_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.quantize_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(num_blocks, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// Dequantize Q8 packed buffer to scalar output.
+pub(crate) fn dequantize_dispatch(
+    ctx: &GpuContext,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    numel: u32,
+    block_size: u32,
+) {
+    let block_stride_u32 = (4 + block_size + 3) / 4;
+    let params = DequantizeParams { numel, block_size, block_stride_u32, _pad: 0 };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("dequantize_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.unary_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: input.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.dequantize_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((numel + 255) / 256, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}
+
+/// Mixed-precision matmul: scalar A × Q8 B → scalar C.
+pub(crate) fn matmul_q8_dispatch(
+    ctx: &GpuContext,
+    a: &wgpu::Buffer,
+    b: &wgpu::Buffer,
+    c: &wgpu::Buffer,
+    m: u32, k: u32, n: u32,
+    block_size: u32,
+) {
+    let blocks_per_col = (k + block_size - 1) / block_size;
+    let block_stride_u32 = (4 + block_size + 3) / 4;
+    let params = MatmulQ8Params {
+        m, k, n, block_size, block_stride_u32, blocks_per_col,
+        _pad0: 0, _pad1: 0,
+    };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("matmul_q8_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.q8_matmul_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: b.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: c.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.matmul_q8_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((n + 15) / 16, (m + 15) / 16, 1);
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
 }

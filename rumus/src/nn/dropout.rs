@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Dropout regularization layer.
 
 use std::collections::HashMap;

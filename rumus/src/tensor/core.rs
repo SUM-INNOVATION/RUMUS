@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Core tensor data model for RUMUS.
 //!
 //! The tensor is partitioned into three strict layers:
@@ -60,14 +61,20 @@ pub struct ParamId(pub usize);
 pub enum DType {
     F32,
     F16,
+    /// Symmetric block-quantized INT8.  Each block of `block_size` elements
+    /// has a 4-byte header (f16 scale in lower 16 bits, 2 bytes padding)
+    /// followed by `block_size` i8 values.
+    Q8 { block_size: usize },
 }
 
 impl DType {
-    /// Size in bytes of a single element.
+    /// Size in bytes of a single element (not meaningful for Q8 — use
+    /// `gpu_buf_size` instead).
     pub fn byte_size(self) -> usize {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
+            DType::Q8 { .. } => 1, // logical element is i8, but use gpu_buf_size for real sizing
         }
     }
 
@@ -76,9 +83,32 @@ impl DType {
     ///
     /// F32: `numel * 4` (always aligned).
     /// F16: `(numel * 2 + 3) & !3` (round up to next 4-byte boundary).
+    /// Q8:  `num_blocks * (4 + block_size) + padding` — 4-byte header per block.
     pub fn gpu_buf_size(self, numel: usize) -> u64 {
-        let raw = numel * self.byte_size();
+        let raw = match self {
+            DType::F32 => numel * 4,
+            DType::F16 => numel * 2,
+            DType::Q8 { block_size } => {
+                let num_blocks = (numel + block_size - 1) / block_size;
+                // 4-byte header (f16 scale + 2B pad) + block_size i8 values per block
+                num_blocks * (4 + block_size)
+            }
+        };
         ((raw + 3) & !3) as u64
+    }
+
+    /// Stride in bytes for one Q8 block (4-byte header + block_size data).
+    /// Panics if not Q8.
+    pub fn q8_block_stride(self) -> usize {
+        match self {
+            DType::Q8 { block_size } => 4 + block_size,
+            _ => panic!("q8_block_stride called on non-Q8 dtype"),
+        }
+    }
+
+    /// Returns true if this is a quantized type.
+    pub fn is_quantized(self) -> bool {
+        matches!(self, DType::Q8 { .. })
     }
 }
 
@@ -285,6 +315,22 @@ impl StorageHandle {
         }
     }
 
+    /// Create GPU-resident Q8 storage wrapping a `wgpu::Buffer`.
+    ///
+    /// `len` is the logical element count (number of original values, not bytes).
+    #[cfg(feature = "gpu")]
+    pub fn new_gpu_q8(buffer: wgpu::Buffer, len: usize, block_size: usize) -> Self {
+        Self {
+            inner: Arc::new(StorageInner {
+                data: RwLock::new(StorageData::Gpu { buffer, len }),
+                len,
+                dtype: DType::Q8 { block_size },
+                version: AtomicUsize::new(0),
+                fence: AtomicUsize::new(NO_FENCE),
+            }),
+        }
+    }
+
     /// Number of elements in this storage.
     pub fn len(&self) -> usize {
         self.inner.len
@@ -361,18 +407,14 @@ impl StorageHandle {
     /// This enables inspection/printing of F16 tensors without panicking.
     pub fn data(&self) -> DataReadGuard<'_> {
         #[cfg(feature = "gpu")]
-        if self.inner.dtype == DType::F16 {
-            // F16 GPU data must be cast to F32 before CPU access.
-            // We do this by creating a temporary F32 buffer on the GPU,
-            // dispatching the cast kernel, downloading, and replacing
-            // the CPU mirror.
-            self.ensure_cpu_f16_as_f32();
-        } else {
-            self.ensure_cpu();
+        match self.inner.dtype {
+            DType::F16 => self.ensure_cpu_f16_as_f32(),
+            DType::Q8 { .. } => self.ensure_cpu_q8_as_f32(),
+            _ => self.ensure_cpu(),
         }
 
         #[cfg(not(feature = "gpu"))]
-        assert_eq!(self.inner.dtype, DType::F32, "F16 tensors require GPU feature");
+        assert_eq!(self.inner.dtype, DType::F32, "F16/Q8 tensors require GPU feature");
 
         parking_lot::RwLockReadGuard::map(self.inner.data.read(), |sd| match sd {
             StorageData::Cpu(v) => v.as_slice(),
@@ -453,6 +495,88 @@ impl StorageHandle {
                 );
                 crate::backend::gpu::compute::cast_f16_to_f32_dispatch(
                     ctx, &gpu, &f32_buf, len as u32,
+                );
+                let cpu_data = ctx.download(&f32_buf, len);
+                ctx.pool.release(f32_buf);
+                StorageData::Both {
+                    cpu: cpu_data,
+                    gpu,
+                    dirty: DirtySide::Clean,
+                }
+            }
+            other => other,
+        };
+
+        *self.inner.data.write() = new_state;
+    }
+
+    /// For Q8 GPU tensors: dequantize to F32 on GPU, download as Vec<f32>.
+    #[cfg(feature = "gpu")]
+    fn ensure_cpu_q8_as_f32(&self) {
+        {
+            let guard = self.inner.data.read();
+            match &*guard {
+                StorageData::Cpu(_) => return,
+                StorageData::Both {
+                    dirty: DirtySide::Clean | DirtySide::Cpu,
+                    ..
+                } => return,
+                _ => {}
+            }
+        }
+
+        let ctx = crate::backend::gpu::context::GpuContext::get()
+            .expect("GPU context required for Q8→F32 dequantize");
+
+        let extracted = {
+            let mut guard = self.inner.data.write();
+            match &*guard {
+                StorageData::Cpu(_) => return,
+                StorageData::Both {
+                    dirty: DirtySide::Clean | DirtySide::Cpu,
+                    ..
+                } => return,
+                _ => {}
+            }
+            std::mem::replace(&mut *guard, StorageData::Transferring)
+        };
+
+        let block_size = match self.inner.dtype {
+            DType::Q8 { block_size } => block_size,
+            _ => unreachable!(),
+        };
+
+        let new_state = match extracted {
+            StorageData::Gpu { buffer, len } => {
+                let f32_buf = ctx.pool.acquire(
+                    &ctx.device,
+                    (len * 4) as u64,
+                    crate::backend::gpu::context::STORAGE_USAGE,
+                );
+                crate::backend::gpu::compute::dequantize_dispatch(
+                    ctx, &buffer, &f32_buf, len as u32, block_size as u32,
+                );
+                let cpu_data = ctx.download(&f32_buf, len);
+                ctx.pool.release(f32_buf);
+                StorageData::Both {
+                    cpu: cpu_data,
+                    gpu: buffer,
+                    dirty: DirtySide::Clean,
+                }
+            }
+            StorageData::Both {
+                gpu,
+                dirty: DirtySide::Gpu,
+                ..
+            } => {
+                let len = self.inner.len;
+                let f32_buf = ctx.pool.acquire(
+                    &ctx.device,
+                    (len * 4) as u64,
+                    crate::backend::gpu::context::STORAGE_USAGE,
+                );
+                crate::backend::gpu::compute::dequantize_dispatch(
+                    ctx, &gpu, &f32_buf, len as u32, block_size as u32,
                 );
                 let cpu_data = ctx.download(&f32_buf, len);
                 ctx.pool.release(f32_buf);

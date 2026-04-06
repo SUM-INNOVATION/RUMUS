@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Adaptive average pooling layer.
 
 use std::collections::HashMap;

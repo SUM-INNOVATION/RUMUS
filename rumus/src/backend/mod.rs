@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Hardware abstraction layer for compute operations.
 //!
 //! The [`Backend`] trait defines the contract that every compute backend

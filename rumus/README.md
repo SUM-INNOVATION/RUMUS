@@ -6,9 +6,9 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 
 | Module | Description |
 |--------|-------------|
-| `tensor` | `StorageHandle` (CPU `Vec` or GPU `wgpu::Buffer` via `parking_lot::RwLock<StorageData>`), `Layout`, `AutogradState`, `DType` (`F32`/`F16`), N-dimensional broadcasting, `to_dtype()` cast, and all tensor operations (`add`, `mul`, `matmul`, `relu`, `sigmoid`, `tanh`, `gelu`, `leaky_relu`, `dropout`, `im2col`, `flatten`, `max_pool2d`, `batch_norm_2d`, `adaptive_avg_pool2d`, `bmm`, `softmax`, `layer_norm`, `embedding_forward`, `cross_entropy_loss`, `broadcast_add/sub/mul`, etc.) |
+| `tensor` | `StorageHandle` (CPU `Vec` or GPU `wgpu::Buffer` via `parking_lot::RwLock<StorageData>`), `Layout`, `AutogradState`, `DType` (`F32`/`F16`/`Q8`), N-dimensional broadcasting, `to_dtype()` cast, `quantize()`/`dequantize()`, and all tensor operations (`add`, `mul`, `matmul`, `relu`, `sigmoid`, `tanh`, `gelu`, `leaky_relu`, `dropout`, `im2col`, `flatten`, `max_pool2d`, `batch_norm_2d`, `adaptive_avg_pool2d`, `bmm`, `softmax`, `layer_norm`, `embedding_forward`, `cross_entropy_loss`, `broadcast_add/sub/mul`, etc.) |
 | `autograd` | Thread-local `Tape`, `GradientStore`, Kahn's algorithm backward engine, `no_grad()` RAII guard, `VersionSnapshot` with `Weak` references, 31 concrete `BackwardOp` variants (incl. `Cast`) |
-| `backend` | `Backend` trait (CPU) + feature-gated `gpu` module: `GpuContext` singleton (`supports_f16`), `BufferPool`, `PipelineCache` (35+ F32 pipelines + 30 F16 pipelines + cast pipelines), WGSL metaprogramming via `alias scalar` |
+| `backend` | `Backend` trait (CPU) + feature-gated `gpu` module: `GpuContext` singleton (`supports_f16`), `BufferPool`, `PipelineCache` (35+ F32 pipelines + 30 F16 + cast + Q8 quantize/dequantize/matmul pipelines), WGSL metaprogramming via `alias scalar` |
 | `nn` | `Parameter`, `Module` trait, `#[derive(Module)]` (re-exported from `rumus-macros`), `Linear`, `Conv2d`, `ConvTranspose2d`, `MaxPool2d`, `AdaptiveAvgPool2d`, `Flatten`, `Dropout`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `MultiheadAttention`, `TransformerBlock`, activations (`relu`, `sigmoid`, `tanh`, `gelu`, `leaky_relu`), `mse_loss`, `cross_entropy_loss`, safetensors IO |
 | `optim` | `Optimizer` trait (`step` + `set_lr`/`get_lr`), `SGD`, `Adam`, `AdamW` — all with CPU + GPU dual-path dispatch. `LRScheduler` trait with `StepLR` and `CosineAnnealingLR`. `clip_grad_norm_` with 3-pass non-stalling GPU strategy |
 | `data` | `Dataset` trait, `DataItem`, `DataLoader` with multithreaded prefetching (`std::thread` + bounded `mpsc`), Fisher-Yates shuffle, deadlock-free `Drop` teardown |
@@ -66,4 +66,9 @@ let loss = trainer.train_step(|| {
 
 ## License
 
-MIT
+Licensed under either of
+
+- [Apache License, Version 2.0](../LICENSE-APACHE)
+- [MIT License](../LICENSE-MIT)
+
+at your option.

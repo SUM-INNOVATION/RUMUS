@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! The core `Module` trait for neural network layers.
 //!
 //! `Module` handles **state management** only: parameter collection,

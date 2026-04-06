@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Learning rate schedulers.
 //!
 //! Schedulers compute the learning rate; the user applies it via

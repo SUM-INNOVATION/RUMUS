@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Procedural macros for the RUMUS deep learning framework.
 //!
 //! Provides `#[derive(Module)]` which auto-generates `parameters()`,

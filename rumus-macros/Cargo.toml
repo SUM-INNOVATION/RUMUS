@@ -1,9 +1,9 @@
 [package]
 name = "rumus-macros"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Proc macros for the RUMUS deep learning framework"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/SUM-INNOVATION/RUMUS"
 readme = "README.md"
 

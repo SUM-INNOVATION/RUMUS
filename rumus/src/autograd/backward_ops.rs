@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Backward operation structs and the version-checking snapshot.
 //!
 //! Each struct captures the minimal data needed to compute gradients for

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Multithreaded data loading with bounded prefetching.
 
 use std::sync::mpsc;

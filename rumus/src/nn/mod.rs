@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Neural network building blocks: parameters, modules, layers, losses, and IO.
 
 mod activations;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Scaled Dot-Product Attention and Multi-Head Attention.
 
 use std::collections::HashMap;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Batch normalization for 2D spatial data (BatchNorm2d).
 
 use std::cell::RefCell;

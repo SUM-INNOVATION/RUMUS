@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! N-dimensional broadcasting utilities (PyTorch/NumPy semantics).
 
 /// Compute the output shape when broadcasting two tensors.

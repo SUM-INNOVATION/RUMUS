@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Kahn's-algorithm backward traversal of the computational graph.
 
 use std::collections::HashMap;

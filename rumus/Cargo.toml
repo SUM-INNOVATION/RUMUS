@@ -1,10 +1,10 @@
 [package]
 name = "rumus"
-version = "0.2.1"
+version = "0.2.2"
 readme = "README.md"
 edition = "2024"
 description = "A native-Rust deep learning framework with explicit memory safety and hardware acceleration"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/SUM-INNOVATION/RUMUS"
 
 [features]

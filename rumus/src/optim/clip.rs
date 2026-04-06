@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Gradient clipping utilities.
 //!
 //! `clip_grad_norm_` computes the global L2 norm of all parameter gradients
