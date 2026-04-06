@@ -341,6 +341,32 @@ impl StorageHandle {
         self.inner.dtype
     }
 
+    /// Unique identity based on the storage pointer address.
+    /// Used by the ONNX tracer to track value names across ops.
+    pub fn ptr_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
+    /// Download the raw GPU buffer bytes without any dtype conversion.
+    ///
+    /// Returns the raw bytes as they exist on the GPU.  For F16 tensors,
+    /// this returns f16 bytes (2 per element).  For F32, f32 bytes (4 per element).
+    /// Used by the ONNX exporter to preserve native F16 weight data.
+    #[cfg(feature = "gpu")]
+    pub fn download_raw_bytes(&self) -> Vec<u8> {
+        self.ensure_gpu();
+        let guard = self.inner.data.read();
+        let buffer = match &*guard {
+            StorageData::Gpu { buffer, .. } => buffer,
+            StorageData::Both { gpu, .. } => gpu,
+            _ => unreachable!("ensure_gpu guarantees GPU data"),
+        };
+        let byte_size = self.inner.dtype.gpu_buf_size(self.inner.len);
+        let ctx = crate::backend::gpu::context::GpuContext::get()
+            .expect("GPU context required for raw download");
+        ctx.download_raw_bytes(buffer, byte_size)
+    }
+
     /// Returns `true` if the data is (at least partially) on the GPU.
     #[cfg(feature = "gpu")]
     pub fn is_gpu(&self) -> bool {

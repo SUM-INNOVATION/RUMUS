@@ -10,6 +10,7 @@ repository = "https://github.com/SUM-INNOVATION/RUMUS"
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:pollster"]
+onnx = ["dep:prost"]
 
 [dependencies]
 rumus-macros = { version = "0.1.2", path = "../rumus-macros" }
@@ -20,3 +21,9 @@ parking_lot = "0.12"
 # GPU-only dependencies (activated by `--features gpu`)
 wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
+
+# ONNX export (activated by `--features onnx`)
+prost = { version = "0.13", optional = true }
+
+[build-dependencies]
+prost-build = "0.13"

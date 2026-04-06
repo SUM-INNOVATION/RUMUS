@@ -745,6 +745,40 @@ impl GpuContext {
         result
     }
 
+    /// Download raw bytes from a GPU buffer without any dtype conversion.
+    ///
+    /// Returns exactly `byte_size` bytes.  Used by the ONNX exporter to
+    /// preserve F16 weight data without casting to F32.
+    pub fn download_raw_bytes(&self, source: &wgpu::Buffer, byte_size: u64) -> Vec<u8> {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging_raw_readback"),
+            size: byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_buffer_to_buffer(source, 0, &staging, 0, byte_size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .expect("map callback not called")
+            .expect("buffer map failed");
+
+        let view = slice.get_mapped_range();
+        let result: Vec<u8> = view.to_vec();
+        drop(view);
+        staging.unmap();
+        result
+    }
+
     /// Upload CPU data to a new GPU buffer.
     pub fn upload(&self, data: &[f32]) -> wgpu::Buffer {
         let byte_size = (data.len() * std::mem::size_of::<f32>()) as u64;

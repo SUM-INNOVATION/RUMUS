@@ -418,7 +418,10 @@ impl Tensor {
             lhs_version: VersionSnapshot::new(lhs_gid, &self.storage),
             rhs_version: VersionSnapshot::new(rhs_gid, &rhs.storage),
         });
-        wrap_binary_result(out_storage, result_shape, self, rhs, lhs_gid, rhs_gid, op)
+        let result = wrap_binary_result(out_storage, result_shape, self, rhs, lhs_gid, rhs_gid, op);
+        #[cfg(feature = "onnx")]
+        crate::onnx::tracer::record_binary(self, rhs, &result, "Add");
+        result
     }
 
     pub fn sub(&self, rhs: &Tensor) -> Tensor {
@@ -464,7 +467,10 @@ impl Tensor {
             rhs_layout: rhs.layout.clone(),
             rhs_version: VersionSnapshot::new(rhs_gid, &rhs.storage),
         });
-        wrap_binary_result(out_storage, result_shape, self, rhs, lhs_gid, rhs_gid, op)
+        let result = wrap_binary_result(out_storage, result_shape, self, rhs, lhs_gid, rhs_gid, op);
+        #[cfg(feature = "onnx")]
+        crate::onnx::tracer::record_binary(self, rhs, &result, "Mul");
+        result
     }
 
     pub fn matmul(&self, rhs: &Tensor) -> Tensor {
@@ -541,7 +547,10 @@ impl Tensor {
             rhs_version: VersionSnapshot::new(rhs_gid, &rhs.storage),
             m, k, n,
         });
-        wrap_binary_result(out_storage, result_shape, self, rhs, lhs_gid, rhs_gid, op)
+        let result = wrap_binary_result(out_storage, result_shape, self, rhs, lhs_gid, rhs_gid, op);
+        #[cfg(feature = "onnx")]
+        crate::onnx::tracer::record_binary(self, rhs, &result, "MatMul");
+        result
     }
 
     pub fn relu(&self) -> Tensor {
@@ -573,7 +582,7 @@ impl Tensor {
             StorageHandle::new(dst)
         };
 
-        if self.requires_grad() && !context::is_no_grad() {
+        let result = if self.requires_grad() && !context::is_no_grad() {
             let out_grad_id = context::next_grad_id();
             let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
 
@@ -611,7 +620,10 @@ impl Tensor {
                 layout: Layout::contiguous(result_shape),
                 state: AutogradState::None,
             }
-        }
+        };
+        #[cfg(feature = "onnx")]
+        crate::onnx::tracer::record_unary(self, &result, "Relu");
+        result
     }
 
     /// Fused MSE loss — always CPU (scalar reduction).  GPU mse_loss is a

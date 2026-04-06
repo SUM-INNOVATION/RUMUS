@@ -111,6 +111,12 @@ impl Conv2d {
         let out_h = (h + 2 * self.padding - self.kernel_size) / self.stride + 1;
         let out_w = (w + 2 * self.padding - self.kernel_size) / self.stride + 1;
 
+        // ONNX tracing: suppress internal ops and emit a fused Conv node.
+        #[cfg(feature = "onnx")]
+        if crate::onnx::tracer::is_tracing() {
+            crate::onnx::tracer::with_tracer(|t| t.enter_fusion());
+        }
+
         let mut batch_outputs: Vec<Tensor> = Vec::with_capacity(batch);
 
         for b in 0..batch {
@@ -139,7 +145,27 @@ impl Conv2d {
 
         // Tracked reshape to final [batch, out_channels, out_h, out_w].
         // Must be tracked so the autograd chain isn't broken.
-        stacked.reshape_tracked(vec![batch, self.out_channels, out_h, out_w])
+        let result = stacked.reshape_tracked(vec![batch, self.out_channels, out_h, out_w]);
+
+        #[cfg(feature = "onnx")]
+        if crate::onnx::tracer::is_tracing() {
+            crate::onnx::tracer::with_tracer(|t| t.leave_fusion());
+            crate::onnx::tracer::trace_conv2d(
+                input,
+                &result,
+                "weight",
+                &self.weight.tensor,
+                self.bias.as_ref().map(|_| "bias"),
+                self.bias.as_ref().map(|b| &b.tensor),
+                self.kernel_size,
+                self.stride,
+                self.padding,
+                self.in_channels,
+                self.out_channels,
+            );
+        }
+
+        result
     }
 }
 

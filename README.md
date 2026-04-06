@@ -32,6 +32,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M10 — Training Ergonomics** | Complete |
 | **M11 — FP16 Mixed Precision** | Complete |
 | **M12 — INT8 Quantization Engine** | Complete |
+| **M13 — ONNX Exporter** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -203,6 +204,20 @@ auto-dispatches `matmul_q8` when rhs is Q8. All quantization ops are untracked
 (PTQ inference-only, `AutogradState::None`). `data()` on Q8 tensors
 dequantizes on GPU before download. Zero new external dependencies.
 
+**M13 — ONNX Exporter (Complete):** Thread-local `onnx::Tracer` context
+(same pattern as autograd) intercepts tensor ops during a tracing forward pass.
+Primitive ops (`Add`, `Mul`, `MatMul`, `Relu`) record `TracedNode` entries;
+composite modules (`Linear` → `Gemm`, `Conv2d` → `Conv`) use
+`enter_fusion()`/`leave_fusion()` to suppress primitives and emit single fused
+ONNX nodes. `TracedGraph` captures nodes, inputs, outputs, and initializers.
+`export_onnx()` serializes to `.onnx` via `prost`-generated Protobuf types
+from a vendored `onnx.proto` schema. F16 weights preserved natively via
+`download_raw_bytes()` (no F32 cast). Q8 weights dequantized to F32 for ONNX
+compatibility. Feature-gated behind `--features onnx`; `prost-build` compiles
+proto at build time (env var `CARGO_FEATURE_ONNX` gating in `build.rs`).
+Configurable opset version (default 17). `StorageHandle::ptr_id()` for value
+identity tracking across ops.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -269,6 +284,8 @@ dequantizes on GPU before download. Zero new external dependencies.
 | `preprocess_shader()` | WGSL metaprogramming: `alias scalar = f32/f16` injection for dual F32/F16 pipelines |
 | `Tensor::quantize()` | Symmetric block INT8 quantization with column-major repacking for matmul locality |
 | `matmul_q8` | Mixed-precision WGSL kernel: scalar A x Q8 B -> scalar C, in-register dequantization |
+| `onnx::Tracer` | Thread-local graph tracer: records `TracedNode` entries, fusion scoping for modules |
+| `export_onnx()` | Single-call ONNX export: trace → `prost` Protobuf serialization → `.onnx` file |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
@@ -299,6 +316,7 @@ cargo test --features gpu     # runs CPU + GPU tests
 External dependencies: `syn`/`quote`/`proc-macro2` (macro crate),
 `safetensors` + `bytemuck` + `parking_lot` (core crate).
 GPU-only (behind `--features gpu`): `wgpu` + `pollster`.
+ONNX export (behind `--features onnx`): `prost` + `prost-build`.
 
 ## License
 

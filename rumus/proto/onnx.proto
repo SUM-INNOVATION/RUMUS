@@ -1,0 +1,100 @@
+// Minimal ONNX protobuf schema for RUMUS export.
+//
+// This is a subset of the official onnx.proto3 from
+// https://github.com/onnx/onnx/blob/main/onnx/onnx.proto3
+// containing only the message types needed for model export.
+// Replace with the full onnx.proto3 for complete runtime compatibility.
+
+syntax = "proto3";
+
+package onnx;
+
+message AttributeProto {
+  string name = 1;
+  int64 type = 20;
+
+  float f = 2;
+  int64 i = 3;
+  string s = 4;
+  TensorProto t = 5;
+
+  repeated float floats = 7;
+  repeated int64 ints = 8;
+  repeated string strings = 9;
+  repeated TensorProto tensors = 10;
+}
+
+message ValueInfoProto {
+  string name = 1;
+  TypeProto type = 2;
+  string doc_string = 3;
+}
+
+message NodeProto {
+  repeated string input = 1;
+  repeated string output = 2;
+  string name = 3;
+  string op_type = 4;
+  string domain = 7;
+  repeated AttributeProto attribute = 5;
+  string doc_string = 6;
+}
+
+message TensorProto {
+  repeated int64 dims = 1;
+  int32 data_type = 2;
+  string name = 8;
+  bytes raw_data = 13;
+
+  repeated float float_data = 4 [packed = true];
+  repeated int32 int32_data = 5 [packed = true];
+  repeated int64 int64_data = 7 [packed = true];
+  repeated double double_data = 10 [packed = true];
+}
+
+message TensorShapeProto {
+  message Dimension {
+    oneof value {
+      int64 dim_value = 1;
+      string dim_param = 2;
+    }
+    string denotation = 3;
+  }
+  repeated Dimension dim = 1;
+}
+
+message TypeProto {
+  message Tensor {
+    int32 elem_type = 1;
+    TensorShapeProto shape = 2;
+  }
+  oneof value {
+    Tensor tensor_type = 1;
+  }
+  string denotation = 6;
+}
+
+message OperatorSetIdProto {
+  string domain = 1;
+  int64 version = 2;
+}
+
+message GraphProto {
+  repeated NodeProto node = 1;
+  string name = 2;
+  repeated TensorProto initializer = 5;
+  string doc_string = 10;
+  repeated ValueInfoProto input = 11;
+  repeated ValueInfoProto output = 12;
+}
+
+message ModelProto {
+  int64 ir_version = 1;
+  repeated OperatorSetIdProto opset_import = 8;
+  string producer_name = 2;
+  string producer_version = 3;
+  string domain = 4;
+  int64 model_version = 5;
+  string doc_string = 6;
+  GraphProto graph = 7;
+}

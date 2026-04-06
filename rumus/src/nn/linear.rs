@@ -74,11 +74,32 @@ impl Linear {
     /// `input` shape: `[batch, in_features]`.
     /// Output shape: `[batch, out_features]`.
     pub fn forward(&self, input: &Tensor) -> Tensor {
+        // ONNX tracing: emit a fused Gemm node instead of matmul + add_bias.
+        #[cfg(feature = "onnx")]
+        if crate::onnx::tracer::is_tracing() {
+            crate::onnx::tracer::with_tracer(|t| t.enter_fusion());
+        }
+
         let out = input.matmul(&self.weight.tensor);
-        match &self.bias {
+        let result = match &self.bias {
             Some(bias) => out.add_bias(&bias.tensor),
             None => out,
+        };
+
+        #[cfg(feature = "onnx")]
+        if crate::onnx::tracer::is_tracing() {
+            crate::onnx::tracer::with_tracer(|t| t.leave_fusion());
+            crate::onnx::tracer::trace_linear(
+                input,
+                &self.weight.tensor,
+                self.bias.as_ref().map(|b| &b.tensor),
+                &result,
+                "weight",
+                self.bias.as_ref().map(|_| "bias"),
+            );
         }
+
+        result
     }
 }
 
