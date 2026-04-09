@@ -402,15 +402,35 @@ fn wrap_binary_result(
 impl Tensor {
     pub fn add(&self, rhs: &Tensor) -> Tensor {
         assert_eq!(self.shape(), rhs.shape(), "add: shape mismatch {:?} vs {:?}", self.shape(), rhs.shape());
-        let lhs_c = self.contiguous();
-        let rhs_c = rhs.contiguous();
-        let result_shape = lhs_c.shape().to_vec();
+        let result_shape = self.shape().to_vec();
 
-        let out_storage = compute_binary(
-            &lhs_c, &rhs_c,
-            CpuBackend::add,
-            #[cfg(feature = "gpu")] gpu_compute::add,
-        );
+        // JIT hook: record op + return deferred storage instead of dispatching.
+        #[cfg(feature = "jit")]
+        let out_storage = if crate::jit::tracer::is_tracing() {
+            let (_, storage) = crate::jit::tracer::with_tracer(|t| {
+                t.record_binary(self, rhs, |d, l, r| crate::jit::tracer::FusedOp::Add(d, l, r))
+            });
+            storage
+        } else {
+            let lhs_c = self.contiguous();
+            let rhs_c = rhs.contiguous();
+            compute_binary(
+                &lhs_c, &rhs_c,
+                CpuBackend::add,
+                #[cfg(feature = "gpu")] gpu_compute::add,
+            )
+        };
+
+        #[cfg(not(feature = "jit"))]
+        let out_storage = {
+            let lhs_c = self.contiguous();
+            let rhs_c = rhs.contiguous();
+            compute_binary(
+                &lhs_c, &rhs_c,
+                CpuBackend::add,
+                #[cfg(feature = "gpu")] gpu_compute::add,
+            )
+        };
 
         let lhs_gid = require_grad_id(self).unwrap_or_else(context::next_grad_id);
         let rhs_gid = require_grad_id(rhs).unwrap_or_else(context::next_grad_id);
@@ -447,15 +467,34 @@ impl Tensor {
 
     pub fn mul(&self, rhs: &Tensor) -> Tensor {
         assert_eq!(self.shape(), rhs.shape(), "mul: shape mismatch {:?} vs {:?}", self.shape(), rhs.shape());
-        let lhs_c = self.contiguous();
-        let rhs_c = rhs.contiguous();
-        let result_shape = lhs_c.shape().to_vec();
+        let result_shape = self.shape().to_vec();
 
-        let out_storage = compute_binary(
-            &lhs_c, &rhs_c,
-            CpuBackend::mul,
-            #[cfg(feature = "gpu")] gpu_compute::mul,
-        );
+        #[cfg(feature = "jit")]
+        let out_storage = if crate::jit::tracer::is_tracing() {
+            let (_, storage) = crate::jit::tracer::with_tracer(|t| {
+                t.record_binary(self, rhs, |d, l, r| crate::jit::tracer::FusedOp::Mul(d, l, r))
+            });
+            storage
+        } else {
+            let lhs_c = self.contiguous();
+            let rhs_c = rhs.contiguous();
+            compute_binary(
+                &lhs_c, &rhs_c,
+                CpuBackend::mul,
+                #[cfg(feature = "gpu")] gpu_compute::mul,
+            )
+        };
+
+        #[cfg(not(feature = "jit"))]
+        let out_storage = {
+            let lhs_c = self.contiguous();
+            let rhs_c = rhs.contiguous();
+            compute_binary(
+                &lhs_c, &rhs_c,
+                CpuBackend::mul,
+                #[cfg(feature = "gpu")] gpu_compute::mul,
+            )
+        };
 
         let lhs_gid = require_grad_id(self).unwrap_or_else(context::next_grad_id);
         let rhs_gid = require_grad_id(rhs).unwrap_or_else(context::next_grad_id);
@@ -554,8 +593,50 @@ impl Tensor {
     }
 
     pub fn relu(&self) -> Tensor {
+        let result_shape = self.shape().to_vec();
+
+        // JIT hook: record Relu + return deferred storage.
+        #[cfg(feature = "jit")]
+        if crate::jit::tracer::is_tracing() {
+            let (_, out_storage) = crate::jit::tracer::with_tracer(|t| {
+                t.record_unary(self, |d, s| crate::jit::tracer::FusedOp::Relu(d, s))
+            });
+
+            // Autograd recording proceeds normally with the deferred storage.
+            let result = if self.requires_grad() && !context::is_no_grad() {
+                let out_grad_id = context::next_grad_id();
+                let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+                if let Some(meta) = self.meta() {
+                    meta.total_grads.fetch_add(1, Ordering::Relaxed);
+                }
+                let op_id = context::with_tape(|tape| {
+                    tape.push(TapeEntry {
+                        op: BackwardOp::Relu(ReluBackward {
+                            input_storage: self.storage.clone(),
+                            input_layout: self.layout.clone(),
+                            input_version: VersionSnapshot::new(in_gid, &self.storage),
+                        }),
+                        inputs: vec![in_gid],
+                        outputs: vec![out_grad_id],
+                    })
+                });
+                Tensor {
+                    storage: out_storage,
+                    layout: Layout::contiguous(result_shape),
+                    state: AutogradState::Tracked(Arc::new(TensorMeta {
+                        requires_grad: true, grad_id: Some(out_grad_id), creator: op_id,
+                        is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                    })),
+                }
+            } else {
+                Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+            };
+            #[cfg(feature = "onnx")]
+            crate::onnx::tracer::record_unary(self, &result, "Relu");
+            return result;
+        }
+
         let input_c = self.contiguous();
-        let result_shape = input_c.shape().to_vec();
         let numel = input_c.numel();
 
         #[cfg(feature = "gpu")]

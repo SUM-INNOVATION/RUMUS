@@ -34,6 +34,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M12 — INT8 Quantization Engine** | Complete |
 | **M13 — ONNX Exporter** | Complete |
 | **M14 — Data Engine (Memory-Mapped Records)** | Complete |
+| **M15 — JIT Compiler (Kernel Fusion)** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -233,6 +234,22 @@ IEEE 754 bit conversion for F16. Single `memcpy` per record (mmap avoids
 syscall overhead, `to_vec()` is a transient CPU staging buffer). `Send + Sync`
 safe for concurrent `DataLoader` workers. New dependency: `memmap2 = "0.9"`.
 
+**M15 — JIT Compiler (Complete):** XLA-style kernel fusion for element-wise ops.
+Thread-local `JitTracer` captures `FusedOp` IR (Add, Sub, Mul, Relu, Sigmoid,
+Tanh, Gelu, LeakyRelu, Scale, Neg) into a `FusionBlock`. `jit::compile(|| ...)`
+scope activates tracing — element-wise ops record IR + return `Deferred` storage
+handles instead of dispatching individual GPU kernels. Autograd tape recording
+proceeds normally (backward ops see the same `StorageHandle` references).
+`codegen::generate_wgsl()` emits straight-line `@compute` kernel: each thread
+processes one element, each `FusedOp` maps to one `let vN = ...;` WGSL line.
+`JitCache` hashes `FusionKey` (op tags + numel + dtype + binding counts) for O(1)
+pipeline reuse — `create_shader_module` + `create_compute_pipeline` compiled once
+per unique op sequence, cached forever. Dynamic `BindGroupLayout` built per
+fusion block (N read + M write + 1 uniform). `flush_block()` materializes
+deferred storages with real GPU buffers after the single fused dispatch.
+`StorageData::Deferred { var_id }` variant panics with clear messages on premature
+access. Feature-gated: `jit = ["gpu"]`. Zero new external dependencies.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -303,6 +320,8 @@ safe for concurrent `DataLoader` workers. New dependency: `memmap2 = "0.9"`.
 | `export_onnx()` | Single-call ONNX export: trace → `prost` Protobuf serialization → `.onnx` file |
 | `RecordWriter` | Append-only `.rrec` writer: sequential tensor serialization + trailing index + header patching |
 | `RecordDataset` | `memmap2::Mmap`-backed `.rrec` reader: O(1) index lookup, `Dataset` trait, `Send + Sync` |
+| `jit::compile()` | JIT fusion scope: traces element-wise ops into `FusedOp` IR, codegen → cached WGSL pipeline |
+| `JitCache` | `FusionKey`-hashed pipeline cache: O(1) hit, one-time compilation per unique op sequence |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine

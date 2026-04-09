@@ -175,6 +175,12 @@ pub(crate) enum StorageData {
     /// anti-pattern in our eager execution model.
     #[cfg(feature = "gpu")]
     Transferring,
+
+    /// JIT deferred: storage will be populated when the fusion block flushes.
+    #[cfg(feature = "jit")]
+    Deferred {
+        var_id: usize,
+    },
 }
 
 impl fmt::Debug for StorageData {
@@ -193,6 +199,10 @@ impl fmt::Debug for StorageData {
                 .finish(),
             #[cfg(feature = "gpu")]
             StorageData::Transferring => write!(f, "Transferring"),
+            #[cfg(feature = "jit")]
+            StorageData::Deferred { var_id } => {
+                f.debug_struct("Deferred").field("var_id", var_id).finish()
+            }
         }
     }
 }
@@ -331,6 +341,29 @@ impl StorageHandle {
         }
     }
 
+    /// Create a deferred (JIT placeholder) storage.
+    ///
+    /// The actual GPU buffer is populated when the JIT fusion block flushes.
+    #[cfg(feature = "jit")]
+    pub fn new_deferred(var_id: usize, len: usize, dtype: DType) -> Self {
+        Self {
+            inner: Arc::new(StorageInner {
+                data: RwLock::new(StorageData::Deferred { var_id }),
+                len,
+                dtype,
+                version: AtomicUsize::new(0),
+                fence: AtomicUsize::new(NO_FENCE),
+            }),
+        }
+    }
+
+    /// Replace the internal StorageData (used by JIT flush to materialize deferred tensors).
+    #[cfg(feature = "jit")]
+    pub fn materialize_gpu(&self, buffer: wgpu::Buffer) {
+        let mut guard = self.inner.data.write();
+        *guard = StorageData::Gpu { buffer, len: self.inner.len };
+    }
+
     /// Number of elements in this storage.
     pub fn len(&self) -> usize {
         self.inner.len
@@ -451,6 +484,10 @@ impl StorageHandle {
             #[cfg(feature = "gpu")]
             StorageData::Transferring => {
                 panic!("cannot read tensor data while a device transfer is in progress")
+            }
+            #[cfg(feature = "jit")]
+            StorageData::Deferred { .. } => {
+                panic!("cannot read JIT-deferred tensor — flush the JIT block first")
             }
         })
     }
@@ -641,6 +678,10 @@ impl StorageHandle {
             StorageData::Transferring => {
                 panic!("cannot write tensor data while a device transfer is in progress")
             }
+            #[cfg(feature = "jit")]
+            StorageData::Deferred { .. } => {
+                panic!("cannot write JIT-deferred tensor — flush the JIT block first")
+            }
         })
     }
 
@@ -667,6 +708,10 @@ impl StorageHandle {
             StorageData::Cpu(_) => unreachable!("ensure_gpu guarantees GPU data"),
             StorageData::Transferring => {
                 panic!("cannot access GPU buffer while a device transfer is in progress")
+            }
+            #[cfg(feature = "jit")]
+            StorageData::Deferred { .. } => {
+                panic!("cannot access GPU buffer of JIT-deferred tensor — flush the JIT block first")
             }
         })
     }
