@@ -33,6 +33,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M11 — FP16 Mixed Precision** | Complete |
 | **M12 — INT8 Quantization Engine** | Complete |
 | **M13 — ONNX Exporter** | Complete |
+| **M14 — Data Engine (Memory-Mapped Records)** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -218,6 +219,20 @@ proto at build time (env var `CARGO_FEATURE_ONNX` gating in `build.rs`).
 Configurable opset version (default 17). `StorageHandle::ptr_id()` for value
 identity tracking across ops.
 
+**M14 — Data Engine (Complete):** `.rrec` (RUMUS Record) binary format for
+high-throughput data loading. 64-byte header (magic `RREC`, version, num_records,
+index_offset) + sequential data blocks (per-tensor meta: ndim/shape/dtype_tag +
+raw bytes + 4-byte alignment padding) + trailing index table (offset/length u64
+pairs for O(1) random access). `RecordWriter`: append-only sequential writer
+with `create`/`append`/`finish` — streams records in a single forward pass,
+patches header on finish. F32 via `bytemuck::cast_slice`, F16 via
+`download_raw_bytes()`. `RecordDataset`: `memmap2::Mmap`-backed reader
+implementing `Dataset` trait — O(1) index lookup, `parse_record` with
+cursor-based byte parsing, `bytemuck::cast_slice` for F32, inline `f16_to_f32`
+IEEE 754 bit conversion for F16. Single `memcpy` per record (mmap avoids
+syscall overhead, `to_vec()` is a transient CPU staging buffer). `Send + Sync`
+safe for concurrent `DataLoader` workers. New dependency: `memmap2 = "0.9"`.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -286,6 +301,8 @@ identity tracking across ops.
 | `matmul_q8` | Mixed-precision WGSL kernel: scalar A x Q8 B -> scalar C, in-register dequantization |
 | `onnx::Tracer` | Thread-local graph tracer: records `TracedNode` entries, fusion scoping for modules |
 | `export_onnx()` | Single-call ONNX export: trace → `prost` Protobuf serialization → `.onnx` file |
+| `RecordWriter` | Append-only `.rrec` writer: sequential tensor serialization + trailing index + header patching |
+| `RecordDataset` | `memmap2::Mmap`-backed `.rrec` reader: O(1) index lookup, `Dataset` trait, `Send + Sync` |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
@@ -314,7 +331,7 @@ cargo test --features gpu     # runs CPU + GPU tests
 ```
 
 External dependencies: `syn`/`quote`/`proc-macro2` (macro crate),
-`safetensors` + `bytemuck` + `parking_lot` (core crate).
+`safetensors` + `bytemuck` + `parking_lot` + `memmap2` (core crate).
 GPU-only (behind `--features gpu`): `wgpu` + `pollster`.
 ONNX export (behind `--features onnx`): `prost` + `prost-build`.
 

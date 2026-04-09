@@ -11,7 +11,7 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 | `backend` | `Backend` trait (CPU) + feature-gated `gpu` module: `GpuContext` singleton (`supports_f16`), `BufferPool`, `PipelineCache` (35+ F32 pipelines + 30 F16 + cast + Q8 quantize/dequantize/matmul pipelines), WGSL metaprogramming via `alias scalar` |
 | `nn` | `Parameter`, `Module` trait, `#[derive(Module)]` (re-exported from `rumus-macros`), `Linear`, `Conv2d`, `ConvTranspose2d`, `MaxPool2d`, `AdaptiveAvgPool2d`, `Flatten`, `Dropout`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `MultiheadAttention`, `TransformerBlock`, activations (`relu`, `sigmoid`, `tanh`, `gelu`, `leaky_relu`), `mse_loss`, `cross_entropy_loss`, safetensors IO |
 | `optim` | `Optimizer` trait (`step` + `set_lr`/`get_lr`), `SGD`, `Adam`, `AdamW` — all with CPU + GPU dual-path dispatch. `LRScheduler` trait with `StepLR` and `CosineAnnealingLR`. `clip_grad_norm_` with 3-pass non-stalling GPU strategy |
-| `data` | `Dataset` trait, `DataItem`, `DataLoader` with multithreaded prefetching (`std::thread` + bounded `mpsc`), Fisher-Yates shuffle, deadlock-free `Drop` teardown |
+| `data` | `Dataset` trait, `DataItem`, `DataLoader` with multithreaded prefetching (`std::thread` + bounded `mpsc`), Fisher-Yates shuffle, deadlock-free `Drop` teardown. `.rrec` binary format: `RecordWriter` (append-only) + `RecordDataset` (`memmap2` zero-copy reader, O(1) index lookup) |
 | `onnx` | (feature-gated) Thread-local `Tracer`, `TracedGraph`, `export_onnx()` — graph tracing + Protobuf serialization to `.onnx` files |
 | `train` | `Trainer<O: Optimizer>` — closure-based `train_step()` orchestrator |
 

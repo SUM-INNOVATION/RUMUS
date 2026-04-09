@@ -13,10 +13,11 @@ gpu = ["dep:wgpu", "dep:pollster"]
 onnx = ["dep:prost"]
 
 [dependencies]
-rumus-macros = { version = "0.1.2", path = "../rumus-macros" }
+rumus-macros = { version = "0.1.3", path = "../rumus-macros" }
 safetensors = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
 parking_lot = "0.12"
+memmap2 = "0.9"
 
 # GPU-only dependencies (activated by `--features gpu`)
 wgpu = { version = "24", optional = true }
