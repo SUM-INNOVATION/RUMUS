@@ -38,6 +38,10 @@ pub use module::Module;
 #[cfg(feature = "gpu")]
 pub use module::ModuleToGpu;
 pub use parameter::Parameter;
+#[cfg(feature = "multi_gpu")]
+pub mod parallel;
+#[cfg(feature = "multi_gpu")]
+pub use parallel::{AllReduceSync, DataParallel};
 
 // Re-export the derive macro so users can write `use rumus::nn::Module;`
 // and `#[derive(Module)]` in the same scope.

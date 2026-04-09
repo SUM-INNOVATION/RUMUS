@@ -17,6 +17,7 @@ use crate::autograd::{
     DropoutBackward, EmbeddingBackward, FlattenBackward, GeluBackward, Im2ColBackward,
     LayerNormBackward, LeakyReluBackward, MatmulBackward, MaxPool2dBackward, MseLossBackward,
     MulBackward, ReluBackward, ReshapeBackward, SigmoidBackward, SoftmaxBackward,
+    CatBackward, SliceRangeBackward,
     StackBackward, SubBackward, TanhBackward, TapeEntry, VersionSnapshot,
 };
 use crate::backend::{Backend, CpuBackend};
@@ -2411,6 +2412,179 @@ impl Tensor {
                 state: AutogradState::None,
             }
         }
+    }
+
+    // === Slice range & Cat =====================================================
+
+    /// Extract a contiguous range along a dimension.
+    ///
+    /// `self.slice_range(0, 2, 6)` on a `[10, D]` tensor returns `[4, D]`.
+    /// Tracked op — `SliceRangeBackward` scatters the gradient back.
+    pub fn slice_range(&self, dim: usize, start: usize, end: usize) -> Tensor {
+        assert!(dim < self.ndim(), "slice_range: dim out of range");
+        assert!(start < end && end <= self.shape()[dim], "slice_range: invalid range");
+
+        let mut result_shape = self.shape().to_vec();
+        result_shape[dim] = end - start;
+        let result_numel: usize = result_shape.iter().product();
+
+        let ic = self.contiguous();
+        let guard = ic.storage.data();
+
+        // Compute strides for source.
+        let ndim = self.ndim();
+        let src_shape = self.shape();
+        let mut src_strides = vec![1usize; ndim];
+        for d in (0..ndim - 1).rev() {
+            src_strides[d] = src_strides[d + 1] * src_shape[d + 1];
+        }
+
+        let mut dst_strides = vec![1usize; ndim];
+        for d in (0..ndim - 1).rev() {
+            dst_strides[d] = dst_strides[d + 1] * result_shape[d + 1];
+        }
+
+        let mut dst = vec![0.0f32; result_numel];
+        for flat in 0..result_numel {
+            let mut rem = flat;
+            let mut src_flat = 0usize;
+            for d in 0..ndim {
+                let coord = rem / dst_strides[d];
+                rem %= dst_strides[d];
+                let src_coord = if d == dim { coord + start } else { coord };
+                src_flat += src_coord * src_strides[d];
+            }
+            dst[flat] = guard[src_flat];
+        }
+        drop(guard);
+
+        let out_storage = StorageHandle::new(dst);
+
+        if self.requires_grad() && !context::is_no_grad() {
+            let out_gid = context::next_grad_id();
+            let in_gid = self.grad_id().unwrap_or_else(context::next_grad_id);
+            if let Some(m) = self.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+
+            let op_id = context::with_tape(|tape| {
+                tape.push(TapeEntry {
+                    op: BackwardOp::SliceRange(SliceRangeBackward {
+                        input_version: VersionSnapshot::new(in_gid, &self.storage),
+                        original_shape: self.shape().to_vec(),
+                        dim, start, end,
+                    }),
+                    inputs: vec![in_gid],
+                    outputs: vec![out_gid],
+                })
+            });
+
+            Tensor {
+                storage: out_storage,
+                layout: Layout::contiguous(result_shape),
+                state: AutogradState::Tracked(Arc::new(TensorMeta {
+                    requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                    is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+                })),
+            }
+        } else {
+            Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
+        }
+    }
+}
+
+/// Concatenate tensors along a dimension.
+///
+/// All tensors must have the same shape except along `dim`.
+/// Tracked op — `CatBackward` splits the gradient.
+pub fn cat(tensors: &[Tensor], dim: usize) -> Tensor {
+    assert!(!tensors.is_empty(), "cat: empty input");
+    let ndim = tensors[0].ndim();
+    assert!(dim < ndim, "cat: dim out of range");
+
+    // Validate shapes.
+    for t in &tensors[1..] {
+        assert_eq!(t.ndim(), ndim, "cat: ndim mismatch");
+        for d in 0..ndim {
+            if d != dim {
+                assert_eq!(t.shape()[d], tensors[0].shape()[d], "cat: shape mismatch at dim {}", d);
+            }
+        }
+    }
+
+    let mut result_shape = tensors[0].shape().to_vec();
+    let splits: Vec<usize> = tensors.iter().map(|t| t.shape()[dim]).collect();
+    result_shape[dim] = splits.iter().sum();
+    let result_numel: usize = result_shape.iter().product();
+
+    // Compute result strides.
+    let mut dst_strides = vec![1usize; ndim];
+    for d in (0..ndim - 1).rev() {
+        dst_strides[d] = dst_strides[d + 1] * result_shape[d + 1];
+    }
+
+    let mut data = vec![0.0f32; result_numel];
+    let mut dim_offset = 0usize;
+
+    for t in tensors {
+        let tc = t.contiguous();
+        let guard = tc.storage.data();
+        let src_shape = t.shape();
+        let src_numel = t.numel();
+
+        let mut src_strides = vec![1usize; ndim];
+        for d in (0..ndim - 1).rev() {
+            src_strides[d] = src_strides[d + 1] * src_shape[d + 1];
+        }
+
+        for flat in 0..src_numel {
+            let mut rem = flat;
+            let mut dst_flat = 0usize;
+            for d in 0..ndim {
+                let coord = rem / src_strides[d];
+                rem %= src_strides[d];
+                let dst_coord = if d == dim { coord + dim_offset } else { coord };
+                dst_flat += dst_coord * dst_strides[d];
+            }
+            data[dst_flat] = guard[flat];
+        }
+        drop(guard);
+        dim_offset += src_shape[dim];
+    }
+
+    let out_storage = StorageHandle::new(data);
+
+    let any_tracked = tensors.iter().any(|t| t.requires_grad())
+        && !context::is_no_grad();
+
+    if any_tracked {
+        let out_gid = context::next_grad_id();
+
+        let mut input_gids = Vec::with_capacity(tensors.len());
+        let mut versions = Vec::with_capacity(tensors.len());
+        for t in tensors {
+            let gid = require_grad_id(t).unwrap_or_else(context::next_grad_id);
+            versions.push(VersionSnapshot::new(gid, &t.storage));
+            if let Some(m) = t.meta() { m.total_grads.fetch_add(1, Ordering::Relaxed); }
+            input_gids.push(gid);
+        }
+
+        let op_id = context::with_tape(|tape| {
+            tape.push(TapeEntry {
+                op: BackwardOp::Cat(CatBackward { splits, dim, versions }),
+                inputs: input_gids,
+                outputs: vec![out_gid],
+            })
+        });
+
+        Tensor {
+            storage: out_storage,
+            layout: Layout::contiguous(result_shape),
+            state: AutogradState::Tracked(Arc::new(TensorMeta {
+                requires_grad: true, grad_id: Some(out_gid), creator: op_id,
+                is_leaf: false, retains_grad: false, total_grads: AtomicUsize::new(0),
+            })),
+        }
+    } else {
+        Tensor { storage: out_storage, layout: Layout::contiguous(result_shape), state: AutogradState::None }
     }
 }
 

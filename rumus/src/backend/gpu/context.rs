@@ -793,3 +793,91 @@ impl GpuContext {
         buffer
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multi-GPU context (feature-gated)
+// ---------------------------------------------------------------------------
+
+/// Multi-GPU context: holds all available discrete GPUs.
+///
+/// Each device gets its own `PipelineCache`, `BufferPool`, and `Queue`.
+/// `GpuContext::get()` returns `&devices[0]` for backward compatibility.
+#[cfg(feature = "multi_gpu")]
+pub struct MultiGpuContext {
+    pub devices: Vec<GpuContext>,
+}
+
+#[cfg(feature = "multi_gpu")]
+static MULTI_GPU: OnceLock<Option<MultiGpuContext>> = OnceLock::new();
+
+#[cfg(feature = "multi_gpu")]
+impl MultiGpuContext {
+    /// Initialize all discrete GPUs.  Returns `None` if no GPUs found.
+    pub fn get() -> Option<&'static MultiGpuContext> {
+        MULTI_GPU
+            .get_or_init(|| {
+                let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+                let all_adapters = instance.enumerate_adapters(wgpu::Backends::all());
+                let adapters: Vec<wgpu::Adapter> = all_adapters
+                    .into_iter()
+                    .filter(|a| {
+                        let info = a.get_info();
+                        info.device_type == wgpu::DeviceType::DiscreteGpu
+                            || info.device_type == wgpu::DeviceType::IntegratedGpu
+                    })
+                    .collect();
+
+                if adapters.is_empty() {
+                    return None;
+                }
+
+                let mut devices = Vec::with_capacity(adapters.len());
+                for adapter in &adapters {
+                    let has_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
+                    let required = if has_f16 {
+                        wgpu::Features::SHADER_F16
+                    } else {
+                        wgpu::Features::empty()
+                    };
+
+                    let result = pollster::block_on(adapter.request_device(
+                        &wgpu::DeviceDescriptor {
+                            label: Some("rumus_multi_gpu"),
+                            required_features: required,
+                            ..Default::default()
+                        },
+                        None,
+                    ));
+
+                    if let Ok((device, queue)) = result {
+                        let pipelines = PipelineCache::new(&device, has_f16);
+                        let pool = BufferPool::new();
+                        devices.push(GpuContext {
+                            device,
+                            queue,
+                            pipelines,
+                            pool,
+                            supports_f16: has_f16,
+                        });
+                    }
+                }
+
+                if devices.is_empty() {
+                    None
+                } else {
+                    Some(MultiGpuContext { devices })
+                }
+            })
+            .as_ref()
+    }
+
+    /// Number of available GPUs.
+    pub fn num_devices(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Get a specific device by index.
+    pub fn device(&self, index: usize) -> &GpuContext {
+        &self.devices[index]
+    }
+}

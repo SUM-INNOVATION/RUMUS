@@ -222,6 +222,8 @@ pub struct StorageInner {
     len: usize,
     /// Element data type.  Immutable after construction.
     dtype: DType,
+    /// Which GPU device this storage lives on (0 = primary, default).
+    pub(crate) device_index: usize,
     /// Monotonically increasing mutation counter for autograd version checking.
     version: AtomicUsize,
     /// Per-resource WGPU fence (AtomicUsize with `usize::MAX` sentinel).
@@ -291,6 +293,7 @@ impl StorageHandle {
                 data: RwLock::new(StorageData::Cpu(data)),
                 len,
                 dtype: DType::F32,
+                device_index: 0,
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
             }),
@@ -305,6 +308,7 @@ impl StorageHandle {
                 data: RwLock::new(StorageData::Gpu { buffer, len }),
                 len,
                 dtype: DType::F32,
+                device_index: 0,
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
             }),
@@ -319,6 +323,7 @@ impl StorageHandle {
                 data: RwLock::new(StorageData::Gpu { buffer, len }),
                 len,
                 dtype: DType::F16,
+                device_index: 0,
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
             }),
@@ -335,6 +340,7 @@ impl StorageHandle {
                 data: RwLock::new(StorageData::Gpu { buffer, len }),
                 len,
                 dtype: DType::Q8 { block_size },
+                device_index: 0,
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
             }),
@@ -351,6 +357,7 @@ impl StorageHandle {
                 data: RwLock::new(StorageData::Deferred { var_id }),
                 len,
                 dtype,
+                device_index: 0,
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
             }),
@@ -367,6 +374,18 @@ impl StorageHandle {
     /// Number of elements in this storage.
     pub fn len(&self) -> usize {
         self.inner.len
+    }
+
+    /// GPU device index this storage lives on.
+    pub fn device_index(&self) -> usize {
+        self.inner.device_index
+    }
+
+    /// Set the device index (only valid on freshly created storage with refcount 1).
+    pub(crate) fn set_device_index(&mut self, idx: usize) {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.device_index = idx;
+        }
     }
 
     /// Element data type.
@@ -395,9 +414,27 @@ impl StorageHandle {
             _ => unreachable!("ensure_gpu guarantees GPU data"),
         };
         let byte_size = self.inner.dtype.gpu_buf_size(self.inner.len);
-        let ctx = crate::backend::gpu::context::GpuContext::get()
-            .expect("GPU context required for raw download");
+        let ctx = self.device_ctx();
         ctx.download_raw_bytes(buffer, byte_size)
+    }
+
+    /// Get the GPU context for this storage's device.
+    ///
+    /// When `multi_gpu` is active, returns the context for the specific
+    /// `device_index`.  Otherwise returns the primary context.
+    #[cfg(feature = "gpu")]
+    fn device_ctx(&self) -> &'static crate::backend::gpu::context::GpuContext {
+        #[cfg(feature = "multi_gpu")]
+        {
+            let mgpu = crate::backend::gpu::context::MultiGpuContext::get()
+                .expect("GPU context required");
+            return mgpu.device(self.inner.device_index);
+        }
+        #[cfg(not(feature = "multi_gpu"))]
+        {
+            crate::backend::gpu::context::GpuContext::get()
+                .expect("GPU context required")
+        }
     }
 
     /// Returns `true` if the data is (at least partially) on the GPU.
@@ -510,8 +547,7 @@ impl StorageHandle {
         }
 
         // Need to cast F16 → F32 on GPU, then download.
-        let ctx = crate::backend::gpu::context::GpuContext::get()
-            .expect("GPU context required for F16→F32 cast");
+        let ctx = self.device_ctx();
 
         // Extract the GPU buffer.
         let extracted = {
@@ -588,8 +624,7 @@ impl StorageHandle {
             }
         }
 
-        let ctx = crate::backend::gpu::context::GpuContext::get()
-            .expect("GPU context required for Q8→F32 dequantize");
+        let ctx = self.device_ctx();
 
         let extracted = {
             let mut guard = self.inner.data.write();
@@ -761,8 +796,7 @@ impl StorageHandle {
         };
         // Write lock dropped here — blocking IO runs lock-free.
 
-        let ctx = crate::backend::gpu::context::GpuContext::get()
-            .expect("GPU context required for device-to-host transfer");
+        let ctx = self.device_ctx();
 
         let new_state = match extracted {
             StorageData::Gpu { buffer, len } => {
@@ -830,8 +864,7 @@ impl StorageHandle {
             std::mem::replace(&mut *guard, StorageData::Transferring)
         };
 
-        let ctx = crate::backend::gpu::context::GpuContext::get()
-            .expect("GPU context required for host-to-device transfer");
+        let ctx = self.device_ctx();
 
         let new_state = match extracted {
             StorageData::Cpu(cpu_data) => {
@@ -1133,5 +1166,57 @@ impl Tensor {
     #[cfg(feature = "gpu")]
     pub fn to_gpu(&self) {
         self.storage.ensure_gpu();
+    }
+
+    /// Move this tensor to a specific GPU device.
+    ///
+    /// - Same device → clone (zero-copy).
+    /// - CPU → target device: upload.
+    /// - Device A → Device B: download to CPU, upload to B (WebGPU has
+    ///   no peer-to-peer DMA).
+    ///
+    /// Returns a new untracked tensor on the target device.
+    #[cfg(feature = "multi_gpu")]
+    pub fn to_device(&self, target_device: usize) -> Tensor {
+        use crate::backend::gpu::context::{MultiGpuContext, STORAGE_USAGE};
+
+        if self.storage.device_index() == target_device {
+            if self.storage.is_gpu() {
+                return self.clone();
+            }
+        }
+
+        let mgpu = MultiGpuContext::get().expect("MultiGpuContext required for to_device");
+        assert!(target_device < mgpu.num_devices(), "device index out of range");
+        let target_ctx = mgpu.device(target_device);
+
+        // Get f32 data on CPU (triggers D2H if needed).
+        let guard = self.storage.data();
+        let cpu_data: &[f32] = &guard;
+
+        // Upload to target device.
+        let byte_size = self.dtype().gpu_buf_size(self.numel());
+        let buffer = target_ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("multi_gpu_transfer"),
+            size: byte_size,
+            usage: STORAGE_USAGE,
+            mapped_at_creation: false,
+        });
+        target_ctx.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(cpu_data));
+        drop(guard);
+
+        let mut storage = StorageHandle::new_gpu(buffer, self.numel());
+        storage.set_device_index(target_device);
+
+        Tensor {
+            storage,
+            layout: crate::tensor::Layout::contiguous(self.shape().to_vec()),
+            state: AutogradState::None,
+        }
+    }
+
+    /// Returns the GPU device index this tensor lives on.
+    pub fn device_index(&self) -> usize {
+        self.storage.device_index()
     }
 }

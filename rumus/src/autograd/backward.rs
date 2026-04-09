@@ -977,10 +977,113 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
 
             BackwardOp::Cast(bw) => {
                 bw.input_version.check()?;
-                // The gradient of a cast is a cast in the reverse direction.
-                // to_dtype inside backward is untracked (no tape exists).
                 let grad_input = out_grad.to_dtype(bw.source_dtype);
                 grads.accumulate(entry.inputs[0], grad_input)?;
+            }
+
+            BackwardOp::SliceRange(bw) => {
+                bw.input_version.check()?;
+                // Scatter grad into a zero tensor at the slice position.
+                let total_numel: usize = bw.original_shape.iter().product();
+                let mut dst = vec![0.0f32; total_numel];
+                let og_c = out_grad.contiguous();
+                let og_guard = og_c.storage.data();
+
+                // Compute strides for the original shape.
+                let ndim = bw.original_shape.len();
+                let mut strides = vec![1usize; ndim];
+                for i in (0..ndim - 1).rev() {
+                    strides[i] = strides[i + 1] * bw.original_shape[i + 1];
+                }
+
+                // Copy grad into the slice region.
+                let slice_numel: usize = og_c.numel();
+                for flat in 0..slice_numel {
+                    // Decompose flat index into coordinates of the output grad.
+                    let mut rem = flat;
+                    let mut src_coords = vec![0usize; ndim];
+                    for d in 0..ndim {
+                        let dim_size = if d == bw.dim {
+                            bw.end - bw.start
+                        } else {
+                            bw.original_shape[d]
+                        };
+                        let s = slice_numel / {
+                            let mut p = 1;
+                            for dd in 0..=d { p *= if dd == bw.dim { bw.end - bw.start } else { bw.original_shape[dd] }; }
+                            p
+                        };
+                        // Actually simpler: use contiguous layout math.
+                        src_coords[d] = rem / (slice_numel / {
+                            let mut p = 1;
+                            for dd in (d..ndim) {
+                                p *= if dd == bw.dim { bw.end - bw.start } else { bw.original_shape[dd] };
+                            }
+                            p
+                        });
+                        rem %= slice_numel / {
+                            let mut p = 1;
+                            for dd in (d..ndim) {
+                                p *= if dd == bw.dim { bw.end - bw.start } else { bw.original_shape[dd] };
+                            }
+                            p
+                        };
+                    }
+                    // Offset the dim coordinate.
+                    src_coords[bw.dim] += bw.start;
+                    let dst_flat: usize = src_coords.iter().zip(strides.iter()).map(|(c, s)| c * s).sum();
+                    dst[dst_flat] = og_guard[flat];
+                }
+                drop(og_guard);
+                grads.accumulate(entry.inputs[0], Tensor::new(dst, bw.original_shape.clone()))?;
+            }
+
+            BackwardOp::Cat(bw) => {
+                for v in &bw.versions {
+                    v.check()?;
+                }
+                // Split the grad along the cat dim.
+                let og_c = out_grad.contiguous();
+                let og_guard = og_c.storage.data();
+                let shape = out_grad.shape();
+                let ndim = shape.len();
+
+                let mut offset = 0usize;
+                for (i, &split_size) in bw.splits.iter().enumerate() {
+                    // Build the slice shape.
+                    let mut slice_shape: Vec<usize> = shape.to_vec();
+                    slice_shape[bw.dim] = split_size;
+                    let slice_numel: usize = slice_shape.iter().product();
+
+                    // Compute strides for the output grad.
+                    let mut out_strides = vec![1usize; ndim];
+                    for d in (0..ndim - 1).rev() {
+                        out_strides[d] = out_strides[d + 1] * shape[d + 1];
+                    }
+
+                    // Extract the slice.
+                    let mut slice_data = vec![0.0f32; slice_numel];
+                    let mut slice_strides = vec![1usize; ndim];
+                    for d in (0..ndim - 1).rev() {
+                        slice_strides[d] = slice_strides[d + 1] * slice_shape[d + 1];
+                    }
+
+                    for flat in 0..slice_numel {
+                        let mut rem = flat;
+                        let mut out_flat = 0usize;
+                        for d in 0..ndim {
+                            let coord = rem / slice_strides[d];
+                            rem %= slice_strides[d];
+                            let out_coord = if d == bw.dim { coord + offset } else { coord };
+                            out_flat += out_coord * out_strides[d];
+                        }
+                        slice_data[flat] = og_guard[out_flat];
+                    }
+
+                    grads.accumulate(entry.inputs[i], Tensor::new(slice_data, slice_shape))?;
+                    offset += split_size;
+                }
+                drop(og_guard);
             }
         }
 

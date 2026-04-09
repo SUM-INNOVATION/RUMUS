@@ -14,6 +14,7 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 | `data` | `Dataset` trait, `DataItem`, `DataLoader` with multithreaded prefetching (`std::thread` + bounded `mpsc`), Fisher-Yates shuffle, deadlock-free `Drop` teardown. `.rrec` binary format: `RecordWriter` (append-only) + `RecordDataset` (`memmap2` zero-copy reader, O(1) index lookup) |
 | `onnx` | (feature-gated) Thread-local `Tracer`, `TracedGraph`, `export_onnx()` — graph tracing + Protobuf serialization to `.onnx` files |
 | `jit` | (feature-gated) JIT kernel fusion: `FusedOp` IR, `codegen` (dynamic WGSL generation), `JitCache` (pipeline caching), `jit::compile()` scope — fuses element-wise ops into single GPU dispatch |
+| `nn::parallel` | (feature-gated) `DataParallel<M>` (scatter-forward-gather via `std::thread::scope`) + `AllReduceSync` (4-phase WebGPU gradient averaging) |
 | `train` | `Trainer<O: Optimizer>` — closure-based `train_step()` orchestrator |
 
 ## Features
@@ -22,6 +23,7 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 - **`gpu`** — Enables WGPU compute backend (`wgpu` + `pollster`). All tensor ops auto-dispatch to WGSL shaders when data is GPU-resident.
 - **`onnx`** — Enables ONNX model export (`prost` + `prost-build`). Trace a forward pass and serialize to `.onnx` for ONNX Runtime / TensorRT.
 - **`jit`** — Enables JIT kernel fusion (implies `gpu`). Fuses element-wise ops into single dynamically generated WGSL kernels with compilation caching.
+- **`multi_gpu`** — Enables distributed multi-GPU training (implies `gpu`). `DataParallel` scatter-forward-gather + `AllReduceSync` gradient averaging.
 
 ## Quick Start
 

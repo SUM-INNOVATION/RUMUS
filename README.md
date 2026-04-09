@@ -35,6 +35,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M13 — ONNX Exporter** | Complete |
 | **M14 — Data Engine (Memory-Mapped Records)** | Complete |
 | **M15 — JIT Compiler (Kernel Fusion)** | Complete |
+| **M16 — Distributed Strategy (Multi-GPU)** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -250,6 +251,22 @@ deferred storages with real GPU buffers after the single fused dispatch.
 `StorageData::Deferred { var_id }` variant panics with clear messages on premature
 access. Feature-gated: `jit = ["gpu"]`. Zero new external dependencies.
 
+**M16 — Distributed Strategy (Complete):** `MultiGpuContext` enumerates all
+discrete/integrated GPUs, initializes each with its own `Device`, `Queue`,
+`BufferPool`, and `PipelineCache`. `device_index: usize` on `StorageInner`
+tracks which GPU a tensor lives on; `device_ctx()` helper routes all
+`ensure_gpu`/`ensure_cpu`/`download_raw_bytes` to the correct device.
+`Tensor::to_device(idx)` transfers via CPU staging (WebGPU has no peer-to-peer
+DMA). `Tensor::slice_range(dim, start, end)` and `tensor::cat(tensors, dim)`
+with tracked backward ops (`SliceRangeBackward`, `CatBackward`).
+`DataParallel<M>` wrapper: broadcasts master weights, scatters input batch via
+`slice_range` + `to_device`, runs forward concurrently via `std::thread::scope`
+(one thread per GPU), gathers output via `cat`. `AllReduceSync` implements
+4-phase WebGPU async gradient averaging: (1) submit `copy_buffer_to_buffer` to
+staging, (2) `map_async` all staging buffers, (3) `device.poll(Wait)` per
+device, (4) read mapped views + element-wise average. Feature-gated:
+`multi_gpu = ["gpu"]`. Zero new external dependencies.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -322,6 +339,10 @@ access. Feature-gated: `jit = ["gpu"]`. Zero new external dependencies.
 | `RecordDataset` | `memmap2::Mmap`-backed `.rrec` reader: O(1) index lookup, `Dataset` trait, `Send + Sync` |
 | `jit::compile()` | JIT fusion scope: traces element-wise ops into `FusedOp` IR, codegen → cached WGSL pipeline |
 | `JitCache` | `FusionKey`-hashed pipeline cache: O(1) hit, one-time compilation per unique op sequence |
+| `MultiGpuContext` | Process-global singleton: enumerates all GPUs, per-device `BufferPool` + `PipelineCache` |
+| `DataParallel<M>` | Scatter-forward-gather wrapper: `std::thread::scope` for concurrent per-GPU forward passes |
+| `AllReduceSync` | 4-phase WebGPU gradient averaging: copy → map_async → poll(Wait) → CPU average |
+| `slice_range` / `cat` | Tracked batch splitting and concatenation along any dimension |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine

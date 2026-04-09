@@ -12,6 +12,7 @@ default = []
 gpu = ["dep:wgpu", "dep:pollster"]
 onnx = ["dep:prost"]
 jit = ["gpu"]
+multi_gpu = ["gpu"]
 
 [dependencies]
 rumus-macros = { version = "0.1.3", path = "../rumus-macros" }

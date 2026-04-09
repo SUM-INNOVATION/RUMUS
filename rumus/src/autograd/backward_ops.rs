@@ -478,6 +478,28 @@ pub enum BackwardOp {
     BatchNorm2d(BatchNorm2dBackward),
     AdaptiveAvgPool2d(AdaptiveAvgPool2dBackward),
     Cast(CastBackward),
+    /// Backward for `slice_range(dim, start, end)`.
+    SliceRange(SliceRangeBackward),
+    /// Backward for `cat(tensors, dim)`.
+    Cat(CatBackward),
+}
+
+/// Backward for `slice_range`: scatter grad into a zero tensor at the slice position.
+#[derive(Debug)]
+pub struct SliceRangeBackward {
+    pub input_version: VersionSnapshot,
+    pub original_shape: Vec<usize>,
+    pub dim: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Backward for `cat`: split the grad along the cat dimension.
+#[derive(Debug)]
+pub struct CatBackward {
+    pub splits: Vec<usize>,  // size of each input along the cat dim
+    pub dim: usize,
+    pub versions: Vec<VersionSnapshot>,
 }
 
 const _: () = {
