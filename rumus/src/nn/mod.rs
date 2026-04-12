@@ -39,7 +39,11 @@ pub use module::Module;
 pub use module::ModuleToGpu;
 pub use parameter::Parameter;
 #[cfg(feature = "multi_gpu")]
+pub mod fsdp;
+#[cfg(feature = "multi_gpu")]
 pub mod parallel;
+#[cfg(feature = "multi_gpu")]
+pub use fsdp::FSDP;
 #[cfg(feature = "multi_gpu")]
 pub use parallel::{AllReduceSync, DataParallel};
 

@@ -482,6 +482,105 @@ pub enum BackwardOp {
     SliceRange(SliceRangeBackward),
     /// Backward for `cat(tensors, dim)`.
     Cat(CatBackward),
+    /// Backward for FSDP sharded linear: re-gathers weights during backward.
+    #[cfg(feature = "multi_gpu")]
+    FsdpLinear(FsdpLinearBackward),
+}
+
+/// Backward for FSDP-sharded linear layer.
+///
+/// During backward, re-gathers the full weight from all shard storages,
+/// Cross-rank synchronization barrier for FSDP gradient reduce-scatter.
+///
+/// Shared across all ranks for a single layer.  Each rank pushes its
+/// local gradient into `grads`, then waits on the `Condvar` until all
+/// ranks have arrived.  The last arrival sums the gradients and wakes
+/// all waiters.
+#[cfg(feature = "multi_gpu")]
+pub struct FsdpSync {
+    pub world_size: usize,
+    pub state: std::sync::Mutex<FsdpSyncState>,
+    pub cvar: std::sync::Condvar,
+}
+
+#[cfg(feature = "multi_gpu")]
+pub struct FsdpSyncState {
+    pub weight_grads: Vec<Vec<f32>>,
+    pub bias_grads: Vec<Vec<f32>>,
+    /// The reduced (summed + averaged) result.  Set by the last arrival.
+    pub weight_result: Option<Vec<f32>>,
+    pub bias_result: Option<Vec<f32>>,
+    /// Counts how many ranks have read the result and exited.
+    pub read_count: usize,
+}
+
+#[cfg(feature = "multi_gpu")]
+impl FsdpSync {
+    pub fn new(world_size: usize) -> Self {
+        Self {
+            world_size,
+            state: std::sync::Mutex::new(FsdpSyncState {
+                weight_grads: Vec::new(),
+                bias_grads: Vec::new(),
+                weight_result: None,
+                bias_result: None,
+                read_count: 0,
+            }),
+            cvar: std::sync::Condvar::new(),
+        }
+    }
+}
+
+#[cfg(feature = "multi_gpu")]
+impl std::fmt::Debug for FsdpSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsdpSync")
+            .field("world_size", &self.world_size)
+            .finish()
+    }
+}
+
+// Safety: FsdpSync uses std::sync primitives — Send + Sync.
+#[cfg(feature = "multi_gpu")]
+unsafe impl Send for FsdpSync {}
+#[cfg(feature = "multi_gpu")]
+unsafe impl Sync for FsdpSync {}
+
+/// computes grad_X and grad_W, then reduce-scatters grad_W back to shards.
+/// The gathered weight is dropped immediately after use.
+#[cfg(feature = "multi_gpu")]
+#[derive(Debug)]
+pub struct FsdpLinearBackward {
+    pub input_version: VersionSnapshot,
+    /// Saved input for grad_W = X^T @ grad_Y.
+    pub input_storage: StorageHandle,
+    pub input_layout: Layout,
+    /// Shard storages from ALL ranks (used to re-gather W during backward).
+    pub weight_shard_storages: Vec<StorageHandle>,
+    pub weight_shard_layouts: Vec<Layout>,
+    /// Full weight shape [D_out, D_in] for re-assembly.
+    pub full_weight_shape: Vec<usize>,
+    /// Per-shard size along dim 0 for this rank's weight shard.
+    pub shard_size: usize,
+    /// Exact row offset in the full weight for this rank's shard.
+    pub weight_shard_offset: usize,
+    /// Which rank this backward op runs on.
+    pub rank: usize,
+    pub world_size: usize,
+    /// Device index for this rank.
+    pub device_index: usize,
+    /// Whether bias exists.
+    pub has_bias: bool,
+    /// Bias shard storages (one per rank), if bias exists.
+    pub bias_shard_storages: Vec<StorageHandle>,
+    /// Full bias shape [D_out].
+    pub full_bias_shape: Vec<usize>,
+    /// Exact offset in the full bias for this rank's shard.
+    pub bias_shard_offset: usize,
+    /// Bias shard size for this rank.
+    pub bias_shard_size: usize,
+    /// Shared cross-rank synchronization barrier for reduce-scatter.
+    pub sync: std::sync::Arc<FsdpSync>,
 }
 
 /// Backward for `slice_range`: scatter grad into a zero tensor at the slice position.

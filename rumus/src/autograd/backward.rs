@@ -1085,6 +1085,150 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                 }
                 drop(og_guard);
             }
+
+            #[cfg(feature = "multi_gpu")]
+            BackwardOp::FsdpLinear(bw) => {
+                bw.input_version.check()?;
+
+                let d_in = bw.full_weight_shape[1];
+                let d_out = bw.full_weight_shape[0];
+                let n = bw.world_size as f32;
+
+                // 1. Re-gather the full weight from shard storages (CPU staging).
+                let full_w = {
+                    let mut all_data: Vec<f32> = Vec::new();
+                    for shard_storage in &bw.weight_shard_storages {
+                        let guard = shard_storage.data();
+                        all_data.extend_from_slice(&guard);
+                        drop(guard);
+                    }
+                    let full_numel: usize = bw.full_weight_shape.iter().product();
+                    all_data.truncate(full_numel);
+                    Tensor::new(all_data, bw.full_weight_shape.clone())
+                };
+
+                // 2. grad_X = grad_Y @ W
+                let w_t = full_w.transpose(0, 1);
+                let grad_x = out_grad.matmul(&w_t);
+                grads.accumulate(entry.inputs[0], grad_x)?;
+                drop(full_w);
+
+                // 3. Compute LOCAL grad_W_full = grad_Y^T @ X
+                let saved_input = Tensor::from_storage_and_layout(
+                    bw.input_storage.clone(), bw.input_layout.clone(),
+                );
+                let og_t = out_grad.transpose(0, 1);
+                let grad_w_local = og_t.matmul(&saved_input);
+                let gw_c = grad_w_local.contiguous();
+                let gw_guard = gw_c.storage.data();
+                let local_gw: Vec<f32> = gw_guard.to_vec();
+                drop(gw_guard);
+                drop(grad_w_local);
+
+                // 4. Compute LOCAL grad_b_full (if bias).
+                let local_gb = if bw.has_bias {
+                    let og_c = out_grad.contiguous();
+                    let ogg = og_c.storage.data();
+                    let batch = out_grad.shape()[0];
+                    let mut gb = vec![0.0f32; d_out];
+                    for b_idx in 0..batch {
+                        for j in 0..d_out {
+                            gb[j] += ogg[b_idx * d_out + j];
+                        }
+                    }
+                    drop(ogg);
+                    gb
+                } else {
+                    vec![]
+                };
+
+                // 5. BARRIER: push local grads, wait for all ranks, reduce.
+                let (reduced_gw, reduced_gb) = {
+                    let sync = &bw.sync;
+                    let mut state = sync.state.lock().unwrap();
+
+                    // Push this rank's local gradients.
+                    state.weight_grads.push(local_gw);
+                    if bw.has_bias {
+                        state.bias_grads.push(local_gb);
+                    }
+
+                    // Am I the last to arrive?
+                    if state.weight_grads.len() == sync.world_size {
+                        // Reduce: sum all ranks' gradients element-wise, then average.
+                        let numel_w = d_out * d_in;
+                        let mut summed_w = vec![0.0f32; numel_w];
+                        for gw in &state.weight_grads {
+                            for (s, &v) in summed_w.iter_mut().zip(gw.iter()) {
+                                *s += v;
+                            }
+                        }
+                        for v in &mut summed_w {
+                            *v /= n;
+                        }
+
+                        let summed_b = if bw.has_bias {
+                            let mut sb = vec![0.0f32; d_out];
+                            for gb in &state.bias_grads {
+                                for (s, &v) in sb.iter_mut().zip(gb.iter()) {
+                                    *s += v;
+                                }
+                            }
+                            for v in &mut sb {
+                                *v /= n;
+                            }
+                            sb
+                        } else {
+                            vec![]
+                        };
+
+                        // Store the result for other threads to read.
+                        state.weight_result = Some(summed_w);
+                        state.bias_result = Some(summed_b);
+                        state.read_count = 0;
+
+                        // Wake all waiting threads.
+                        sync.cvar.notify_all();
+                    } else {
+                        // Wait for the last rank to finish reducing.
+                        state = sync.cvar.wait_while(state, |s| {
+                            s.weight_result.is_none()
+                        }).unwrap();
+                    }
+
+                    // Read the reduced result.
+                    let rw = state.weight_result.as_ref().unwrap().clone();
+                    let rb = state.bias_result.as_ref().cloned().unwrap_or_default();
+                    state.read_count += 1;
+
+                    // Last reader clears the state for the next iteration.
+                    if state.read_count == sync.world_size {
+                        state.weight_grads.clear();
+                        state.bias_grads.clear();
+                        state.weight_result = None;
+                        state.bias_result = None;
+                        state.read_count = 0;
+                    }
+
+                    (rw, rb)
+                };
+
+                // 6. Scatter: slice this rank's shard from the reduced gradient.
+                let shard_start = bw.weight_shard_offset * d_in;
+                let shard_end = shard_start + bw.shard_size * d_in;
+                let shard_data = reduced_gw[shard_start..shard_end].to_vec();
+                let shard_grad = Tensor::new(shard_data, vec![bw.shard_size, d_in]);
+                grads.accumulate(entry.inputs[1], shard_grad)?;
+
+                // 7. Bias shard gradient.
+                if bw.has_bias {
+                    let bs_start = bw.bias_shard_offset;
+                    let bs_end = bs_start + bw.bias_shard_size;
+                    let bs_data = reduced_gb[bs_start..bs_end].to_vec();
+                    let bs_grad = Tensor::new(bs_data, vec![bw.bias_shard_size]);
+                    grads.accumulate(entry.inputs[2], bs_grad)?;
+                }
+            }
         }
 
         for &input_id in &entry.inputs {
