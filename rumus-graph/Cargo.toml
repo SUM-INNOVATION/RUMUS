@@ -1,0 +1,12 @@
+[package]
+name = "rumus-graph"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Sparse graph engine for RUMUS — WebGPU-native fused SpMM for GNNs"
+repository = "https://github.com/SUM-INNOVATION/RUMUS"
+
+[dependencies]
+rumus = { version = "0.3.0", path = "../rumus", features = ["gpu"] }
+wgpu = "24"
+bytemuck = { version = "1.14", features = ["derive"] }

@@ -40,6 +40,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M18 — FSDP (Fully Sharded Data Parallelism)** | Complete |
 | **M19 — Custom Ops Extension API** | Complete |
 | **M20 — Inference Server (Continuous Batching)** | Complete |
+| **M21 — Sparse Graph Engine (GNNs)** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -312,6 +313,17 @@ Prefill (full padded sequence + mask, populates KV-cache per layer) → Decode l
 `MockTransformer` with `prefill()` / `decode_step()` demonstrating mask-aware
 attention and KV-cache extension. Scatter-return via `oneshot_tx` per request.
 
+**M21 — Sparse Graph Engine (Complete):** `rumus-graph` library crate for GNNs.
+`SparseTensor` in CSR format (`row_ptr`, `col_indices`, `values` as GPU buffers
+via `BufferPool`). `Graph` holds both forward (A) and backward (A^T) CSR
+representations — transpose pre-computed at construction to bypass WGSL's lack
+of f32 atomics. Fused SpMM WGSL kernel (`spmm.wgsl`): 1 thread per node,
+edge-outer / dim-inner loop for cache locality, `workgroup_size(256)`.
+`SpMMOp` implements `CustomOp` (M19 plugin API) with 6 dynamic bindings.
+`SpMMBackward` implements `CustomBackward` — runs SpMM on transposed graph for
+gradient routing. Fully differentiable `graph.spmm(features)` API. Nodes sorted
+by degree to mitigate subgroup divergence.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -391,6 +403,8 @@ attention and KV-cache extension. Scatter-return via `oneshot_tx` per request.
 | `flash_attention` | O(N) VRAM FlashAttention: tiled online softmax, auto-fallback to SDPA for training |
 | `FSDP` | Fully Sharded Data Parallelism: 1/N params per rank, All-Gather + `FsdpSync` Reduce-Scatter |
 | `CustomOp` / `CustomBackward` | Plugin API: user-defined WGSL kernels + autograd, `CustomOpCache` pipeline caching |
+| `SparseTensor` / `Graph` | CSR format GPU graph with forward + transposed adjacency for differentiable SpMM |
+| `SpMMOp` | Fused Sparse-Dense MatMul via M19 plugin: 1 thread/node, edge-outer loop, zero intermediate VRAM |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
@@ -403,19 +417,21 @@ Kahn's algorithm in reverse tape order:
 
 ## Building
 
-The project is a Cargo workspace with three crates:
+The project is a Cargo workspace with four crates:
 
 ```
 RUMUS/
 ├── rumus/          # core framework (lib)
 ├── rumus-macros/   # #[derive(Module)] proc macro (lib)
-└── rumus-serve/    # inference server (bin)
+├── rumus-serve/    # inference server (bin)
+└── rumus-graph/    # sparse graph engine for GNNs (lib)
 ```
 
 ```bash
 cargo build                        # CPU-only build
 cargo build --features gpu         # with WGPU GPU backend
 cargo build -p rumus-serve         # inference server
+cargo build -p rumus-graph         # graph engine
 cargo test                         # runs all tests (CPU)
 cargo test --features gpu          # runs CPU + GPU tests
 ```
@@ -425,6 +441,7 @@ External dependencies: `syn`/`quote`/`proc-macro2` (macro crate),
 GPU-only (behind `--features gpu`): `wgpu` + `pollster`.
 ONNX export (behind `--features onnx`): `prost` + `prost-build`.
 Inference server (`rumus-serve`): `axum` + `tokio` + `serde` + `tower-http`.
+Graph engine (`rumus-graph`): `rumus` with `gpu` feature + `wgpu` + `bytemuck`.
 
 ## License
 
