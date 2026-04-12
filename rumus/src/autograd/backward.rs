@@ -1229,6 +1229,25 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
                     grads.accumulate(entry.inputs[2], bs_grad)?;
                 }
             }
+
+            BackwardOp::Custom(custom) => {
+                for vs in &custom.input_versions {
+                    vs.check()?;
+                }
+                // Reconstruct saved tensors from their StorageHandle + Layout.
+                let saved: Vec<Tensor> = custom.saved_storages.iter()
+                    .zip(custom.saved_layouts.iter())
+                    .map(|(s, l)| Tensor::from_storage_and_layout(s.clone(), l.clone()))
+                    .collect();
+                // Invoke the user's backward math.
+                let input_grads = custom.handler.backward(&out_grad, &saved);
+                // Accumulate each gradient against the corresponding input GradId.
+                for (i, grad) in input_grads.into_iter().enumerate() {
+                    if i < entry.inputs.len() {
+                        grads.accumulate(entry.inputs[i], grad)?;
+                    }
+                }
+            }
         }
 
         for &input_id in &entry.inputs {

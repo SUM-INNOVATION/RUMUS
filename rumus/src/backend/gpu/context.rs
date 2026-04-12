@@ -659,12 +659,101 @@ fn bgl_uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
 
 /// Process-global GPU context holding device, queue, pipeline cache, and
 /// buffer pool.
+/// Cache for dynamically compiled custom op pipelines.
+pub struct CustomOpCache {
+    cache: parking_lot::Mutex<std::collections::HashMap<CustomOpKey, std::sync::Arc<CachedCustomPipeline>>>,
+}
+
+/// Key for looking up a custom op's compiled pipeline.
+#[derive(Hash, PartialEq, Eq)]
+pub struct CustomOpKey {
+    pub op_name: String,
+    pub dtype_tag: u8,
+    pub num_inputs: usize,
+}
+
+/// A compiled custom op pipeline + its bind group layout.
+pub struct CachedCustomPipeline {
+    pub pipeline: wgpu::ComputePipeline,
+    pub layout: wgpu::BindGroupLayout,
+}
+
+impl CustomOpCache {
+    pub fn new() -> Self {
+        Self {
+            cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Look up or compile a custom op pipeline.
+    pub fn get_or_compile(
+        &self,
+        key: &CustomOpKey,
+        device: &wgpu::Device,
+        wgsl: &str,
+        entry_point: &str,
+        num_inputs: usize,
+    ) -> std::sync::Arc<CachedCustomPipeline> {
+        // Fast path.
+        {
+            let cache = self.cache.lock();
+            if let Some(entry) = cache.get(key) {
+                return std::sync::Arc::clone(entry);
+            }
+        }
+
+        // Slow path: compile.
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("custom_op"),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+
+        // Dynamic bind group layout: N read + 1 rw + 1 uniform.
+        let total_bindings = num_inputs + 2; // +1 output, +1 uniform
+        let mut entries = Vec::with_capacity(total_bindings);
+        for i in 0..num_inputs {
+            entries.push(bgl_storage(i as u32, true));
+        }
+        entries.push(bgl_storage_rw(num_inputs as u32));
+        entries.push(bgl_uniform((num_inputs + 1) as u32));
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("custom_op_layout"),
+            entries: &entries,
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("custom_op_pl"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("custom_op_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let entry = std::sync::Arc::new(CachedCustomPipeline { pipeline, layout });
+        self.cache.lock().insert(CustomOpKey {
+            op_name: key.op_name.clone(),
+            dtype_tag: key.dtype_tag,
+            num_inputs: key.num_inputs,
+        }, std::sync::Arc::clone(&entry));
+        entry
+    }
+}
+
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub pipelines: PipelineCache,
     pub pool: BufferPool,
     pub supports_f16: bool,
+    pub custom_ops: CustomOpCache,
 }
 
 /// Prepend a `scalar` type alias to a WGSL shader source.
@@ -724,6 +813,7 @@ impl GpuContext {
                     pipelines,
                     pool,
                     supports_f16: has_f16,
+                    custom_ops: CustomOpCache::new(),
                 })
             })
             .as_ref()
@@ -879,6 +969,7 @@ impl MultiGpuContext {
                             pipelines,
                             pool,
                             supports_f16: has_f16,
+                            custom_ops: CustomOpCache::new(),
                         });
                     }
                 }

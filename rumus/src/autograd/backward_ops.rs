@@ -5,8 +5,10 @@
 //! its corresponding forward op.  No opaque closures — every backward op
 //! is a concrete, inspectable type that is `Send + Sync` by construction.
 
+use std::sync::Arc;
+
 use crate::autograd::AutogradError;
-use crate::tensor::{GradId, Layout, StorageHandle, WeakStorageHandle};
+use crate::tensor::{GradId, Layout, StorageHandle, Tensor, WeakStorageHandle};
 
 // ---------------------------------------------------------------------------
 // VersionSnapshot — weak-reference version checker
@@ -485,6 +487,44 @@ pub enum BackwardOp {
     /// Backward for FSDP sharded linear: re-gathers weights during backward.
     #[cfg(feature = "multi_gpu")]
     FsdpLinear(FsdpLinearBackward),
+    /// User-defined custom backward op via `Arc<dyn CustomBackward>`.
+    Custom(CustomBackwardOp),
+}
+
+// ---------------------------------------------------------------------------
+// Custom backward op (plugin system)
+// ---------------------------------------------------------------------------
+
+/// Trait for user-defined backward computations.
+///
+/// Implement this to define custom gradient math for operations injected
+/// via `ext::custom_forward`.
+pub trait CustomBackward: Send + Sync + std::fmt::Debug {
+    /// Compute input gradients given the output gradient and saved tensors.
+    ///
+    /// Returns one gradient per input (in forward input order).
+    fn backward(&self, out_grad: &Tensor, saved: &[Tensor]) -> Vec<Tensor>;
+}
+
+/// Backward state for a custom op: the user's handler + saved tensors.
+pub struct CustomBackwardOp {
+    /// The user's backward implementation.
+    pub handler: Arc<dyn CustomBackward>,
+    /// Version snapshots for each input (for mutation checking).
+    pub input_versions: Vec<VersionSnapshot>,
+    /// Tensors saved during forward for use in backward.
+    pub saved_storages: Vec<StorageHandle>,
+    pub saved_layouts: Vec<Layout>,
+    pub saved_shapes: Vec<Vec<usize>>,
+}
+
+impl std::fmt::Debug for CustomBackwardOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomBackwardOp")
+            .field("handler", &self.handler)
+            .field("num_saved", &self.saved_storages.len())
+            .finish()
+    }
 }
 
 /// Backward for FSDP-sharded linear layer.

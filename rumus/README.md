@@ -15,6 +15,8 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 | `onnx` | (feature-gated) Thread-local `Tracer`, `TracedGraph`, `export_onnx()` — graph tracing + Protobuf serialization to `.onnx` files |
 | `jit` | (feature-gated) JIT kernel fusion: `FusedOp` IR, `codegen` (dynamic WGSL generation), `JitCache` (pipeline caching), `jit::compile()` scope — fuses element-wise ops into single GPU dispatch |
 | `nn::parallel` | (feature-gated) `DataParallel<M>` (scatter-forward-gather via `std::thread::scope`) + `AllReduceSync` (4-phase WebGPU gradient averaging) |
+| `nn::fsdp` | (feature-gated) `FSDP` — Fully Sharded Data Parallelism: 1/N params per rank, All-Gather forward, `FsdpSync` barrier Reduce-Scatter backward |
+| `ext` | (feature-gated: `gpu`) `CustomOp` + `CustomBackward` plugin API, `CustomOpCache` for dynamic WGSL compilation, `custom_forward()` dispatcher |
 | `train` | `Trainer<O: Optimizer>` — closure-based `train_step()` orchestrator |
 
 ## Features

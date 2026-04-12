@@ -36,6 +36,9 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M14 — Data Engine (Memory-Mapped Records)** | Complete |
 | **M15 — JIT Compiler (Kernel Fusion)** | Complete |
 | **M16 — Distributed Strategy (Multi-GPU)** | Complete |
+| **M17 — FlashAttention** | Complete |
+| **M18 — FSDP (Fully Sharded Data Parallelism)** | Complete |
+| **M19 — Custom Ops Extension API** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -267,6 +270,35 @@ staging, (2) `map_async` all staging buffers, (3) `device.poll(Wait)` per
 device, (4) read mapped views + element-wise average. Feature-gated:
 `multi_gpu = ["gpu"]`. Zero new external dependencies.
 
+**M17 — FlashAttention (Complete):** Memory-efficient scaled dot-product
+attention via tiled online softmax. 1D workgroup (64 threads, one per query
+row) cooperatively loads K/V blocks into `var<workgroup>` shared memory, each
+thread independently computes its row's attention via online softmax recurrence
+(`m_i`, `l_i`, `o_i` private state). No N×N attention matrix materialized.
+Causal mask via early column-loop exit. `select_flash_block_sizes(d, dtype)`
+dynamically fits B_r/B_c within 16KB shared memory budget. Transparent autograd
+fallback: if inputs require grad, delegates to standard SDPA with full tape
+recording. `flash_attn_pipeline` with 5 bindings (Q+K+V+O+params).
+
+**M18 — FSDP (Complete):** Fully Sharded Data Parallelism — each rank stores
+only 1/N of every parameter. `FSDP::new(model, device_ids, rank)` slices
+parameters along dim 0. `forward_linear` All-Gathers full weight from shard
+storages, computes inside `no_grad()` (prevents autograd leak), drops gathered
+weight immediately, pushes `FsdpLinearBackward` to tape. Backward re-gathers
+weight, computes grad_X and grad_W locally, then mid-tape Reduce-Scatter via
+`FsdpSync` barrier (`Mutex` + `Condvar`): all ranks push local gradients, last
+arrival sums and averages, `notify_all`, each rank slices its shard using exact
+`weight_shard_offset`. True FSDP memory profile — peak VRAM = one layer's worth
+of params, not the entire model.
+
+**M19 — Custom Ops Extension API (Complete):** `CustomOp` trait for user-defined
+WGSL kernels (`wgsl_source`, `entry_point`, `output_shape`). `custom_forward()`
+dynamically compiles and caches pipelines via `CustomOpCache` (separate from core
+`PipelineCache`, namespace-isolated). `CustomBackward` trait for user-defined
+gradient math. `BackwardOp::Custom(CustomBackwardOp)` — the single
+`Arc<dyn CustomBackward>` escape hatch in the concrete enum. Saved tensors
+captured via `save_for_backward`. GPU feature-gated. Zero new dependencies.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -343,6 +375,9 @@ device, (4) read mapped views + element-wise average. Feature-gated:
 | `DataParallel<M>` | Scatter-forward-gather wrapper: `std::thread::scope` for concurrent per-GPU forward passes |
 | `AllReduceSync` | 4-phase WebGPU gradient averaging: copy → map_async → poll(Wait) → CPU average |
 | `slice_range` / `cat` | Tracked batch splitting and concatenation along any dimension |
+| `flash_attention` | O(N) VRAM FlashAttention: tiled online softmax, auto-fallback to SDPA for training |
+| `FSDP` | Fully Sharded Data Parallelism: 1/N params per rank, All-Gather + `FsdpSync` Reduce-Scatter |
+| `CustomOp` / `CustomBackward` | Plugin API: user-defined WGSL kernels + autograd, `CustomOpCache` pipeline caching |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
