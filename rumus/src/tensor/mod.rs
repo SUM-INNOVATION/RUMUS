@@ -5,3 +5,5 @@ mod ops;
 
 pub use self::core::*;
 pub use self::ops::{cat, stack};
+#[cfg(feature = "gpu")]
+pub use self::ops::flash_attention;

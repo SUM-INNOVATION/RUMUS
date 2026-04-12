@@ -2666,3 +2666,78 @@ pub fn stack(tensors: &[Tensor]) -> Tensor {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// FlashAttention
+// ---------------------------------------------------------------------------
+
+/// Memory-efficient scaled dot-product attention (FlashAttention).
+///
+/// Computes `O = softmax(Q @ K^T / sqrt(d)) @ V` without materializing
+/// the `[N, N]` attention matrix.
+///
+/// Input shapes: `Q`, `K`, `V` all `[batch, num_heads, seq_len, head_dim]`.
+/// Output: `[batch, num_heads, seq_len, head_dim]`.
+///
+/// **Autograd fallback:** If any input requires a gradient and we're not
+/// in `no_grad()`, delegates to standard `scaled_dot_product_attention`.
+#[cfg(feature = "gpu")]
+pub fn flash_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Tensor {
+    assert_eq!(q.ndim(), 4, "flash_attention: Q must be 4-D [B, H, N, d]");
+    assert_eq!(k.ndim(), 4, "flash_attention: K must be 4-D [B, H, N, d]");
+    assert_eq!(v.ndim(), 4, "flash_attention: V must be 4-D [B, H, N, d]");
+    assert_eq!(q.shape(), k.shape(), "flash_attention: Q/K shape mismatch");
+    assert_eq!(q.shape(), v.shape(), "flash_attention: Q/V shape mismatch");
+    assert!(q.shape()[3] <= 128, "flash_attention: head_dim must be <= 128");
+
+    let needs_grad = (q.requires_grad() || k.requires_grad() || v.requires_grad())
+        && !crate::autograd::context::is_no_grad();
+    if needs_grad {
+        let mask = if causal {
+            let n = q.shape()[2];
+            let mut mask_data = vec![0.0f32; n * n];
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    mask_data[i * n + j] = -1e9;
+                }
+            }
+            Some(Tensor::new(mask_data, vec![n, n]))
+        } else {
+            None
+        };
+        return crate::nn::attention::scaled_dot_product_attention(q, k, v, mask.as_ref());
+    }
+
+    let batch = q.shape()[0];
+    let heads = q.shape()[1];
+    let seq_len = q.shape()[2];
+    let head_dim = q.shape()[3];
+    let batch_heads = (batch * heads) as u32;
+
+    let (b_r, b_c) = gpu_compute::select_flash_block_sizes(head_dim, q.dtype());
+
+    let ctx = GpuContext::get().expect("GPU required for FlashAttention");
+    let qc = q.contiguous();
+    let kc = k.contiguous();
+    let vc = v.contiguous();
+    let qb = qc.storage.gpu_buffer();
+    let kb = kc.storage.gpu_buffer();
+    let vb = vc.storage.gpu_buffer();
+
+    let out_numel = batch * heads * seq_len * head_dim;
+    let out_buf = ctx.pool.acquire(&ctx.device, q.dtype().gpu_buf_size(out_numel), STORAGE_USAGE);
+
+    gpu_compute::flash_attention_dispatch(
+        ctx, &qb, &kb, &vb, &out_buf,
+        batch_heads, seq_len as u32, head_dim as u32,
+        b_r, b_c, causal,
+    );
+    drop(qb); drop(kb); drop(vb);
+
+    let out_storage = StorageHandle::new_gpu(out_buf, out_numel);
+    Tensor {
+        storage: out_storage,
+        layout: Layout::contiguous(vec![batch, heads, seq_len, head_dim]),
+        state: AutogradState::None,
+    }
+}

@@ -2058,3 +2058,84 @@ pub(crate) fn matmul_q8_dispatch(
     }
     ctx.queue.submit(std::iter::once(encoder.finish()));
 }
+
+// ---------------------------------------------------------------------------
+// FlashAttention
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FlashAttnParams {
+    batch_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+    b_r: u32,
+    b_c: u32,
+    num_col_blocks: u32,
+    scale: f32,
+    causal: u32,
+}
+
+/// Select optimal block sizes that keep shared memory under 16KB.
+///
+/// Shared memory = 2 * B_c * d * elem_size bytes (K_block + V_block).
+/// We also need B_c ≤ 16 for the private `scores` array in WGSL.
+pub(crate) fn select_flash_block_sizes(d: usize, dtype: crate::tensor::DType) -> (u32, u32) {
+    let elem = dtype.byte_size();
+    let b_r: u32 = 64; // workgroup_size
+    // 2 * B_c * d * elem <= 16384
+    let max_bc = 16384 / (2 * d * elem);
+    let b_c = (max_bc.min(16).max(4)) as u32;
+    (b_r, b_c)
+}
+
+/// Dispatch the FlashAttention kernel.
+pub(crate) fn flash_attention_dispatch(
+    ctx: &GpuContext,
+    q: &wgpu::Buffer,
+    k: &wgpu::Buffer,
+    v: &wgpu::Buffer,
+    o: &wgpu::Buffer,
+    batch_heads: u32,
+    seq_len: u32,
+    head_dim: u32,
+    b_r: u32,
+    b_c: u32,
+    causal: bool,
+) {
+    let num_col_blocks = (seq_len + b_c - 1) / b_c;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let params = FlashAttnParams {
+        batch_heads, seq_len, head_dim,
+        b_r, b_c, num_col_blocks,
+        scale,
+        causal: if causal { 1 } else { 0 },
+    };
+    let params_buf = ctx.device.create_buffer_init(&BufferInitDescriptor {
+        label: Some("flash_attn_params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &ctx.pipelines.flash_attn_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: q.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: k.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: v.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: o.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: params_buf.as_entire_binding() },
+        ],
+        label: None,
+    });
+
+    let row_blocks = (seq_len + b_r - 1) / b_r;
+    let mut encoder = ctx.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ctx.pipelines.flash_attn_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(row_blocks, batch_heads, 1);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+}

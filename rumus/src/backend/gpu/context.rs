@@ -121,6 +121,10 @@ pub struct PipelineCache {
     pub q8_matmul_layout: wgpu::BindGroupLayout,
     pub matmul_q8_pipeline: wgpu::ComputePipeline,
 
+    // FlashAttention: Q(read) + K(read) + V(read) + O(rw) + uniform
+    pub flash_attn_layout: wgpu::BindGroupLayout,
+    pub flash_attn_pipeline: wgpu::ComputePipeline,
+
     // F16 pipeline variants (None if GPU doesn't support shader-f16)
     pub f16: Option<F16Pipelines>,
 }
@@ -502,6 +506,21 @@ impl PipelineCache {
         });
         let matmul_q8_pipeline = make_pipeline(&q8_matmul_layout, &matmul_q8_module, "matmul_q8_kernel", "matmul_q8");
 
+        // ---- FlashAttention pipeline -------------------------------------------
+        let flash_attn_src = include_str!("shaders/flash_attn.wgsl");
+        let flash_attn_module = make_module(device, "flash_attn", flash_attn_src, DType::F32);
+        let flash_attn_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("flash_attn_layout"),
+            entries: &[
+                bgl_storage(0, true),   // Q
+                bgl_storage(1, true),   // K
+                bgl_storage(2, true),   // V
+                bgl_storage_rw(3),      // O
+                bgl_uniform(4),
+            ],
+        });
+        let flash_attn_pipeline = make_pipeline(&flash_attn_layout, &flash_attn_module, "flash_attn_kernel", "flash_attn");
+
         // ---- Cast and F16 pipelines (conditional) ------------------------------
 
         let (cast_f32_to_f16_pipeline, cast_f16_to_f32_pipeline, f16_pipelines) = if supports_f16 {
@@ -595,6 +614,8 @@ impl PipelineCache {
             dequantize_pipeline,
             q8_matmul_layout,
             matmul_q8_pipeline,
+            flash_attn_layout,
+            flash_attn_pipeline,
             cast_f32_to_f16_pipeline,
             cast_f16_to_f32_pipeline,
             f16: f16_pipelines,
