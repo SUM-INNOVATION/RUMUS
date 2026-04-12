@@ -1,0 +1,19 @@
+[package]
+name = "rumus-serve"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "High-throughput inference server for RUMUS with continuous batching"
+repository = "https://github.com/SUM-INNOVATION/RUMUS"
+
+[[bin]]
+name = "rumus-serve"
+path = "src/main.rs"
+
+[dependencies]
+rumus = { version = "0.3.0", path = "../rumus", features = ["gpu"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-http = { version = "0.6", features = ["cors"] }

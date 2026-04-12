@@ -39,6 +39,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M17 — FlashAttention** | Complete |
 | **M18 — FSDP (Fully Sharded Data Parallelism)** | Complete |
 | **M19 — Custom Ops Extension API** | Complete |
+| **M20 — Inference Server (Continuous Batching)** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -299,6 +300,18 @@ gradient math. `BackwardOp::Custom(CustomBackwardOp)` — the single
 `Arc<dyn CustomBackward>` escape hatch in the concrete enum. Saved tensors
 captured via `save_for_backward`. GPU feature-gated. Zero new dependencies.
 
+**M20 — Inference Server (Complete):** `rumus-serve` binary crate — high-throughput
+LLM inference with continuous batching. `axum` + `tokio` HTTP server with
+`POST /v1/generate` endpoint. Async↔sync bridge: bounded `tokio::sync::mpsc`
+channel connects HTTP handlers to a dedicated GPU `std::thread`. Per-request
+`oneshot` channel for zero-lock response routing. Deadline-timer batch collection
+(5ms default). `pad_batch` generates both `input_ids: [B, max_seq]` and
+`attention_mask: [B, max_seq]` (1.0 real, 0.0 padding). Two-phase generation:
+Prefill (full padded sequence + mask, populates KV-cache per layer) → Decode loop
+(only `[B, 1]` new tokens + KV-cache, O(1) per step instead of O(N²)).
+`MockTransformer` with `prefill()` / `decode_step()` demonstrating mask-aware
+attention and KV-cache extension. Scatter-return via `oneshot_tx` per request.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -390,25 +403,28 @@ Kahn's algorithm in reverse tape order:
 
 ## Building
 
-The project is a Cargo workspace with two crates:
+The project is a Cargo workspace with three crates:
 
 ```
 RUMUS/
-├── rumus/          # core framework
-└── rumus-macros/   # #[derive(Module)] proc macro
+├── rumus/          # core framework (lib)
+├── rumus-macros/   # #[derive(Module)] proc macro (lib)
+└── rumus-serve/    # inference server (bin)
 ```
 
 ```bash
-cargo build                   # CPU-only build
-cargo build --features gpu    # with WGPU GPU backend
-cargo test                    # runs all tests (CPU)
-cargo test --features gpu     # runs CPU + GPU tests
+cargo build                        # CPU-only build
+cargo build --features gpu         # with WGPU GPU backend
+cargo build -p rumus-serve         # inference server
+cargo test                         # runs all tests (CPU)
+cargo test --features gpu          # runs CPU + GPU tests
 ```
 
 External dependencies: `syn`/`quote`/`proc-macro2` (macro crate),
 `safetensors` + `bytemuck` + `parking_lot` + `memmap2` (core crate).
 GPU-only (behind `--features gpu`): `wgpu` + `pollster`.
 ONNX export (behind `--features onnx`): `prost` + `prost-build`.
+Inference server (`rumus-serve`): `axum` + `tokio` + `serde` + `tower-http`.
 
 ## License
 
