@@ -1,0 +1,10 @@
+[package]
+name = "rumus-vision"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Spatial CNN engine for RUMUS — direct-convolution and pooling via WebGPU"
+repository = "https://github.com/SUM-INNOVATION/RUMUS"
+
+[dependencies]
+rumus = { version = "0.3.0", path = "../rumus", features = ["gpu"] }

@@ -41,6 +41,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M19 — Custom Ops Extension API** | Complete |
 | **M20 — Inference Server (Continuous Batching)** | Complete |
 | **M21 — Sparse Graph Engine (GNNs)** | Complete |
+| **M22 — Spatial Engine (Direct Conv & Pool)** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -324,6 +325,19 @@ edge-outer / dim-inner loop for cache locality, `workgroup_size(256)`.
 gradient routing. Fully differentiable `graph.spmm(features)` API. Nodes sorted
 by degree to mitigate subgroup divergence.
 
+**M22 — Spatial Engine (Complete):** `rumus-vision` library crate for CNNs.
+Direct sliding-window Conv2d WGSL kernel — 1 thread per output pixel, triple
+nested loop (C_in × K_h × K_w), handles stride/padding/dilation, zero im2col
+VRAM. Three backward kernels: `conv2d_backward_data` (transposed convolution for
+grad_input), `conv2d_backward_weight` (gradient accumulation over batch ×
+spatial), `conv2d_backward_bias` (channel-wise reduction). MaxPool2d with
+F16-safe local window argmax: stores `ky * kernel_w + kx` (bounded by K²,
+lossless in f16) in concatenated output buffer. Backward reconstructs global
+input coordinates from local index + output position. `assert!(K_h * K_w <=
+2048)` enforces the f16 precision bound. Tracked `slice_range` + `reshape_tracked`
+preserve autograd chain from combined output to user-facing tensor. All ops via
+M19 `CustomOp` / `CustomBackward` plugin API.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -405,6 +419,8 @@ by degree to mitigate subgroup divergence.
 | `CustomOp` / `CustomBackward` | Plugin API: user-defined WGSL kernels + autograd, `CustomOpCache` pipeline caching |
 | `SparseTensor` / `Graph` | CSR format GPU graph with forward + transposed adjacency for differentiable SpMM |
 | `SpMMOp` | Fused Sparse-Dense MatMul via M19 plugin: 1 thread/node, edge-outer loop, zero intermediate VRAM |
+| `conv2d` (vision) | Direct sliding-window Conv2d: zero im2col VRAM, stride/padding/dilation, 3 backward kernels |
+| `max_pool2d` (vision) | F16-safe local-window argmax, concatenated output, `assert!(K² ≤ 2048)` precision guard |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
@@ -417,14 +433,15 @@ Kahn's algorithm in reverse tape order:
 
 ## Building
 
-The project is a Cargo workspace with four crates:
+The project is a Cargo workspace with five crates:
 
 ```
 RUMUS/
 ├── rumus/          # core framework (lib)
 ├── rumus-macros/   # #[derive(Module)] proc macro (lib)
 ├── rumus-serve/    # inference server (bin)
-└── rumus-graph/    # sparse graph engine for GNNs (lib)
+├── rumus-graph/    # sparse graph engine for GNNs (lib)
+└── rumus-vision/   # spatial CNN engine (lib)
 ```
 
 ```bash
@@ -432,6 +449,7 @@ cargo build                        # CPU-only build
 cargo build --features gpu         # with WGPU GPU backend
 cargo build -p rumus-serve         # inference server
 cargo build -p rumus-graph         # graph engine
+cargo build -p rumus-vision        # spatial CNN engine
 cargo test                         # runs all tests (CPU)
 cargo test --features gpu          # runs CPU + GPU tests
 ```

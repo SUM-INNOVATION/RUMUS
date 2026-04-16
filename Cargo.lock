@@ -1077,6 +1077,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumus-vision"
+version = "0.1.0"
+dependencies = [
+ "rumus",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
