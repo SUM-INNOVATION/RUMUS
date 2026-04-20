@@ -82,9 +82,31 @@ let pooled = ops::max_pool2d(&output, (2,2), (2,2), (0,0));
 | `maxpool2d_direct.wgsl` | input + combined_output + params (64B) | 1 thread / output pixel |
 | `maxpool2d_backward.wgsl` | grad_out + combined + grad_in + params (48B) | 1 thread / output pixel |
 
+### INT4 Weight-Only Quantization (AWQ/GPTQ)
+
+8x compression vs F32 for serving massive LLMs on limited VRAM.
+
+- `QuantizedTensor`: packs 8 × 4-bit unsigned weights per `u32`, K-major layout
+- K padded to `group_size` (must be multiple of 8, e.g., 128) — clean word boundaries
+- Group-wise `scales` and `zero_points` as `[num_groups, N]` f32, grouped along K
+- `qmatmul_int4.wgsl`: fused dequant-matmul — unpacks 8 nibbles per u32 via `(packed >> (j*4)) & 0xF`, dequantizes `(q - zp) × scale`, accumulates dot product in registers
+- `qmatmul_int4_transpose.wgsl`: transpose variant for activation gradients (`grad_x`)
+- `QLinear::from_linear(linear, group_size)`: quantizes a pre-trained `Linear` layer
+- Frozen weights (`AutogradState::None`) + optional trainable bias (LoRA-compatible)
+- `QLinearBackward` returns only `grad_x` — frozen INT4 inputs get no gradients
+
+```rust
+use rumus_vision::QLinear;
+
+let qlinear = QLinear::from_linear(&pretrained_linear, 128);
+let output = qlinear.forward(&input);  // fused INT4 dequant-matmul
+```
+
 ## Dependencies
 
 - `rumus` (v0.3.0) — core framework with GPU backend and M19 Custom Ops API
+- `wgpu` — WebGPU buffer types
+- `bytemuck` — safe byte reinterpretation
 
 ## License
 

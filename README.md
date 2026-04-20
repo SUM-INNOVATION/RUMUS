@@ -42,6 +42,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M20 — Inference Server (Continuous Batching)** | Complete |
 | **M21 — Sparse Graph Engine (GNNs)** | Complete |
 | **M22 — Spatial Engine (Direct Conv & Pool)** | Complete |
+| **M23 — Ultra-Low Precision (INT4 AWQ/GPTQ)** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -338,6 +339,19 @@ input coordinates from local index + output position. `assert!(K_h * K_w <=
 preserve autograd chain from combined output to user-facing tensor. All ops via
 M19 `CustomOp` / `CustomBackward` plugin API.
 
+**M23 — Ultra-Low Precision (Complete):** INT4 weight-only quantization
+(AWQ/GPTQ-style). `QuantizedTensor` packs 8 × 4-bit unsigned weights per `u32`,
+K-major layout. K padded to `group_size` (multiple of 8) — eliminates word
+overflow. Group-wise scales/zero-points `[num_groups, N]` as f32, grouped along
+K. `qmatmul_int4.wgsl`: fused dequant-matmul, 1 thread per output element,
+group-outer / word-inner loop, 8-nibble unpacking via `(packed >> (j*4)) & 0xF`,
+dequant `(q - zp) * scale`. `qmatmul_int4_transpose.wgsl` for activation
+gradient `grad_x = grad_y @ dequant(W)^T`. `QLinear` module: frozen INT4 weights
+(`AutogradState::None` — no GradId, no optimizer) + optional trainable bias
+(LoRA-compatible). `QLinearBackward` returns `vec![grad_x]` only — frozen inputs
+skipped. `from_linear(linear, group_size)` quantizes pre-trained weights. 8x
+compression vs F32, 4x vs F16.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -421,6 +435,7 @@ M19 `CustomOp` / `CustomBackward` plugin API.
 | `SpMMOp` | Fused Sparse-Dense MatMul via M19 plugin: 1 thread/node, edge-outer loop, zero intermediate VRAM |
 | `conv2d` (vision) | Direct sliding-window Conv2d: zero im2col VRAM, stride/padding/dilation, 3 backward kernels |
 | `max_pool2d` (vision) | F16-safe local-window argmax, concatenated output, `assert!(K² ≤ 2048)` precision guard |
+| `QLinear` / `QuantizedTensor` | INT4 weight-only quantization: 8 per u32, group-wise K-major, fused dequant-matmul |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine

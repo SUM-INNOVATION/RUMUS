@@ -1080,7 +1080,9 @@ dependencies = [
 name = "rumus-vision"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "rumus",
+ "wgpu",
 ]
 
 [[package]]

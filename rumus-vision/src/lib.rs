@@ -18,5 +18,7 @@
 //! ```
 
 pub mod ops;
+pub mod quant;
 
 pub use ops::{conv2d, max_pool2d, ConvParams, PoolParams};
+pub use quant::{QLinear, QuantizedTensor};
