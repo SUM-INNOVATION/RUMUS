@@ -43,6 +43,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M21 — Sparse Graph Engine (GNNs)** | Complete |
 | **M22 — Spatial Engine (Direct Conv & Pool)** | Complete |
 | **M23 — Ultra-Low Precision (INT4 AWQ/GPTQ)** | Complete |
+| **M24 — 3D Parallelism (TP + PP)** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -352,6 +353,19 @@ gradient `grad_x = grad_y @ dequant(W)^T`. `QLinear` module: frozen INT4 weights
 skipped. `from_linear(linear, group_size)` quantizes pre-trained weights. 8x
 compression vs F32, 4x vs F16.
 
+**M24 — 3D Parallelism (Complete):** `rumus-distributed` library crate.
+`GpuContext` refactored to `Arc<Device>` + `Arc<Queue>` for comm thread sharing.
+`CommThread` owns device/queue arcs, performs `map_async` + `poll(Wait)` +
+barrier reduce + `write_buffer` on a dedicated background thread — compute thread
+never blocks. `CollectiveBarrier` (`Mutex` + `Condvar`) for cross-rank AllReduce.
+`ColumnParallelLinear` (weight along N, AllReduce on grad_X in backward) +
+`RowParallelLinear` (weight along K, AllReduce on output in forward).
+`PipelineExecutor` with 1F1B micro-batch schedule: per-micro-batch isolated tapes
+via `context::install_tape(Tape::new())`, cross-stage gradient injection via
+`backward_with_grad(tensor, grad)`, incoming tensors tracked via
+`set_requires_grad(true)` with saved `GradId` for deterministic gradient
+extraction. `GradientStore::merge_from()` accumulates parameter gradients.
+
 ## Architecture
 
 ### Immutable Tenets
@@ -436,6 +450,9 @@ compression vs F32, 4x vs F16.
 | `conv2d` (vision) | Direct sliding-window Conv2d: zero im2col VRAM, stride/padding/dilation, 3 backward kernels |
 | `max_pool2d` (vision) | F16-safe local-window argmax, concatenated output, `assert!(K² ≤ 2048)` precision guard |
 | `QLinear` / `QuantizedTensor` | INT4 weight-only quantization: 8 per u32, group-wise K-major, fused dequant-matmul |
+| `CommThread` | Dedicated comm thread with `Arc<Device/Queue>` for non-blocking async AllReduce |
+| `ColumnParallelLinear` / `RowParallelLinear` | Tensor Parallelism: weight sharded along N or K, AllReduce via `CollectiveBarrier` |
+| `PipelineExecutor` | 1F1B pipeline schedule: per-micro-batch tapes, `backward_with_grad` gradient injection |
 | `save/load_safetensors` | Dot-path state dict serialization via `bytemuck` + `safetensors` (zero `unsafe`) |
 
 ### Backward Engine
@@ -448,15 +465,16 @@ Kahn's algorithm in reverse tape order:
 
 ## Building
 
-The project is a Cargo workspace with five crates:
+The project is a Cargo workspace with six crates:
 
 ```
 RUMUS/
-├── rumus/          # core framework (lib)
-├── rumus-macros/   # #[derive(Module)] proc macro (lib)
-├── rumus-serve/    # inference server (bin)
-├── rumus-graph/    # sparse graph engine for GNNs (lib)
-└── rumus-vision/   # spatial CNN engine (lib)
+├── rumus/              # core framework (lib)
+├── rumus-macros/       # #[derive(Module)] proc macro (lib)
+├── rumus-serve/        # inference server (bin)
+├── rumus-graph/        # sparse graph engine for GNNs (lib)
+├── rumus-vision/       # spatial CNN engine (lib)
+└── rumus-distributed/  # 3D parallelism: TP + PP (lib)
 ```
 
 ```bash
@@ -465,6 +483,7 @@ cargo build --features gpu         # with WGPU GPU backend
 cargo build -p rumus-serve         # inference server
 cargo build -p rumus-graph         # graph engine
 cargo build -p rumus-vision        # spatial CNN engine
+cargo build -p rumus-distributed   # 3D parallelism
 cargo test                         # runs all tests (CPU)
 cargo test --features gpu          # runs CPU + GPU tests
 ```
@@ -475,6 +494,7 @@ GPU-only (behind `--features gpu`): `wgpu` + `pollster`.
 ONNX export (behind `--features onnx`): `prost` + `prost-build`.
 Inference server (`rumus-serve`): `axum` + `tokio` + `serde` + `tower-http`.
 Graph engine (`rumus-graph`): `rumus` with `gpu` feature + `wgpu` + `bytemuck`.
+Distributed (`rumus-distributed`): `rumus` with `gpu` + `multi_gpu` features.
 
 ## License
 

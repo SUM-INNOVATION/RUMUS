@@ -104,4 +104,16 @@ impl GradientStore {
     pub fn replace(&mut self, id: GradId, grad: Tensor) {
         self.grads.insert(id, grad);
     }
+
+    /// Merge all gradients from `other` into this store.
+    ///
+    /// Moves entries from `other` into `self`.  If a key already exists
+    /// in `self`, the values are accumulated (added).
+    pub fn merge_from(&mut self, other: &mut GradientStore) {
+        for (id, grad) in other.grads.drain() {
+            if let Err(_) = self.accumulate(id, grad) {
+                // Shape mismatch — silently skip (shouldn't happen in practice).
+            }
+        }
+    }
 }

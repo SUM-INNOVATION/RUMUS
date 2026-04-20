@@ -25,7 +25,7 @@ mod backward_ops;
 mod gradient_store;
 mod tape;
 
-pub use backward::backward;
+pub use backward::{backward, backward_with_grad};
 pub use backward_ops::*;
 pub use gradient_store::*;
 pub use tape::*;

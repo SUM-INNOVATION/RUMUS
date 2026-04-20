@@ -1047,6 +1047,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rumus-distributed"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "rumus",
+ "wgpu",
+]
+
+[[package]]
 name = "rumus-graph"
 version = "0.1.0"
 dependencies = [
@@ -1078,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "rumus-vision"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "rumus",

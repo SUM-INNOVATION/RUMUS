@@ -1,0 +1,12 @@
+[package]
+name = "rumus-distributed"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "3D parallelism for RUMUS: Tensor Parallelism, Pipeline Parallelism, async collectives"
+repository = "https://github.com/SUM-INNOVATION/RUMUS"
+
+[dependencies]
+rumus = { version = "0.3.0", path = "../rumus", features = ["gpu", "multi_gpu"] }
+wgpu = "24"
+bytemuck = { version = "1.14", features = ["derive"] }

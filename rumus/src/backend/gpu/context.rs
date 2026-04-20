@@ -748,8 +748,8 @@ impl CustomOpCache {
 }
 
 pub struct GpuContext {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    pub device: std::sync::Arc<wgpu::Device>,
+    pub queue: std::sync::Arc<wgpu::Queue>,
     pub pipelines: PipelineCache,
     pub pool: BufferPool,
     pub supports_f16: bool,
@@ -808,8 +808,8 @@ impl GpuContext {
                 let pipelines = PipelineCache::new(&device, has_f16);
                 let pool = BufferPool::new();
                 Some(GpuContext {
-                    device,
-                    queue,
+                    device: std::sync::Arc::new(device),
+                    queue: std::sync::Arc::new(queue),
                     pipelines,
                     pool,
                     supports_f16: has_f16,
@@ -964,8 +964,8 @@ impl MultiGpuContext {
                         let pipelines = PipelineCache::new(&device, has_f16);
                         let pool = BufferPool::new();
                         devices.push(GpuContext {
-                            device,
-                            queue,
+                            device: std::sync::Arc::new(device),
+                            queue: std::sync::Arc::new(queue),
                             pipelines,
                             pool,
                             supports_f16: has_f16,

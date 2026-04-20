@@ -74,8 +74,18 @@ where
 ///
 /// Returns `None` if no tape exists (no tracked ops were recorded).
 /// After this call, the next tracked op will create a fresh tape.
-pub(crate) fn take_tape() -> Option<Tape> {
+pub fn take_tape() -> Option<Tape> {
     CONTEXT.with(|c| c.borrow_mut().tape.take())
+}
+
+/// Install a pre-built tape into the thread-local context.
+///
+/// Used by the pipeline executor to set up per-micro-batch isolated tapes.
+/// If a tape already exists, it is replaced (the old tape is dropped).
+pub fn install_tape(tape: Tape) {
+    CONTEXT.with(|c| {
+        c.borrow_mut().tape = Some(tape);
+    });
 }
 
 /// Returns `true` if tape recording is currently suppressed by a

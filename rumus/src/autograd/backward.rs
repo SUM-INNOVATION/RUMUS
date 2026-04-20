@@ -110,8 +110,6 @@ fn negate_tensor(t: &Tensor) -> Tensor {
 ///
 /// See module-level docs for the full Kahn's algorithm description.
 pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
-    let root_grad_id = tensor.grad_id().ok_or(AutogradError::NoGraph)?;
-
     assert_eq!(
         tensor.numel(),
         1,
@@ -119,19 +117,32 @@ pub fn backward(tensor: &Tensor) -> Result<GradientStore, AutogradError> {
         tensor.numel(),
     );
 
-    let tape = context::take_tape().ok_or(AutogradError::NoGraph)?;
-    let entries = tape.into_entries();
-
-    let mut grads = GradientStore::new();
     let seed = Tensor::new(vec![1.0f32], tensor.shape().to_vec());
-    // If the root tensor is GPU-resident, push the seed to the GPU so
-    // the entire backward pass stays on-device — all tensor ops check
-    // is_gpu() and dispatch WGSL kernels automatically.
     #[cfg(feature = "gpu")]
     if tensor.storage.is_gpu() {
         seed.to_gpu();
     }
-    grads.accumulate(root_grad_id, seed)?;
+
+    backward_with_grad(tensor, seed)
+}
+
+/// Execute the backward pass with an externally provided gradient seed.
+///
+/// Like [`backward`], but instead of seeding with `[1.0]`, the caller
+/// provides the gradient tensor.  The tensor does NOT need to be scalar.
+///
+/// Used by pipeline parallelism for cross-stage gradient injection.
+pub fn backward_with_grad(
+    tensor: &Tensor,
+    grad_output: Tensor,
+) -> Result<GradientStore, AutogradError> {
+    let root_grad_id = tensor.grad_id().ok_or(AutogradError::NoGraph)?;
+
+    let tape = context::take_tape().ok_or(AutogradError::NoGraph)?;
+    let entries = tape.into_entries();
+
+    let mut grads = GradientStore::new();
+    grads.accumulate(root_grad_id, grad_output)?;
 
     let mut pending: HashMap<GradId, usize> = HashMap::new();
     for entry in &entries {
