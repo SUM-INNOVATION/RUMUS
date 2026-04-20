@@ -7,6 +7,6 @@ description = "3D parallelism for RUMUS: Tensor Parallelism, Pipeline Parallelis
 repository = "https://github.com/SUM-INNOVATION/RUMUS"
 
 [dependencies]
-rumus = { version = "0.3.0", path = "../rumus", features = ["gpu", "multi_gpu"] }
+rumus = { version = "0.3.1", path = "../rumus", features = ["gpu", "multi_gpu"] }
 wgpu = "24"
 bytemuck = { version = "1.14", features = ["derive"] }

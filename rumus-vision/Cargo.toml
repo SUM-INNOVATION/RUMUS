@@ -7,6 +7,6 @@ description = "Spatial CNN engine for RUMUS — direct-convolution and pooling v
 repository = "https://github.com/SUM-INNOVATION/RUMUS"
 
 [dependencies]
-rumus = { version = "0.3.0", path = "../rumus", features = ["gpu"] }
+rumus = { version = "0.3.1", path = "../rumus", features = ["gpu"] }
 wgpu = "24"
 bytemuck = { version = "1.14", features = ["derive"] }

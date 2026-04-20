@@ -1,6 +1,6 @@
 [package]
 name = "rumus"
-version = "0.3.0"
+version = "0.3.1"
 readme = "README.md"
 edition = "2024"
 description = "A native-Rust deep learning framework with explicit memory safety and hardware acceleration"

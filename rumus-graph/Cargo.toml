@@ -7,6 +7,6 @@ description = "Sparse graph engine for RUMUS — WebGPU-native fused SpMM for GN
 repository = "https://github.com/SUM-INNOVATION/RUMUS"
 
 [dependencies]
-rumus = { version = "0.3.0", path = "../rumus", features = ["gpu"] }
+rumus = { version = "0.3.1", path = "../rumus", features = ["gpu"] }
 wgpu = "24"
 bytemuck = { version = "1.14", features = ["derive"] }
