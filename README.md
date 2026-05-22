@@ -44,6 +44,7 @@ pure, and strict *formula* for high-performance deep learning in Rust.
 | **M22 — Spatial Engine (Direct Conv & Pool)** | Complete |
 | **M23 — Ultra-Low Precision (INT4 AWQ/GPTQ)** | Complete |
 | **M24 — 3D Parallelism (TP + PP)** | Complete |
+| **M25 — Deterministic Fixed-Point Engine** | Complete |
 
 **Milestone 1** delivers the foundational tensor data model (`StorageHandle`,
 `Layout`, `AutogradState`), the `Backend` trait, a pure-Rust CPU backend with
@@ -365,6 +366,19 @@ via `context::install_tape(Tape::new())`, cross-stage gradient injection via
 `backward_with_grad(tensor, grad)`, incoming tensors tracked via
 `set_requires_grad(true)` with saved `GradId` for deterministic gradient
 extraction. `GradientStore::merge_from()` accumulates parameter gradients.
+
+**M25 — Deterministic Fixed-Point Engine (Complete):** first-class
+`DType::FixedI16 { scale_log2 }` backed by a new integer storage variant
+(`StorageData::CpuI16` — raw `i16`, never `Vec<f32>`). CPU-only, inference-only,
+integer-only: no `f32` is produced or consumed on this path, and `Tensor::data()`
+(the f32 accessor) fails loudly on a fixed-point tensor — there is no implicit
+conversion. Explicit constructors/accessors (`Tensor::from_i16_fixed`,
+`fixed_i16_data`). `rumus::fixed` module: `FixedLinear` (widened `i64`
+multiply-accumulate, integer bias promotion `<< scale_log2`, round-half-away-from-zero
+requantization, saturating cast to `i16`), integer `relu`, and named
+`FixedRounding` / `FixedOverflow` semantics. Canonical, dependency-free
+`FixedFixture` JSON export with byte-stable output for zero-knowledge (halo2)
+proof fixtures.
 
 ## Architecture
 

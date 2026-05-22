@@ -1,0 +1,36 @@
+{
+  "format": "rumus-fixed-fixture",
+  "version": 1,
+  "dtype": "FixedI16",
+  "scale_log2": 8,
+  "scale": 256,
+  "rounding": "nearest_ties_away_from_zero",
+  "overflow": "saturate_i16",
+  "layers": [
+    {
+      "kind": "linear",
+      "in_features": 2,
+      "out_features": 2,
+      "weight_shape": [2, 2],
+      "weight": [256, -256, 256, 256],
+      "bias_shape": null,
+      "bias": null
+    },
+    {
+      "kind": "relu"
+    },
+    {
+      "kind": "linear",
+      "in_features": 2,
+      "out_features": 1,
+      "weight_shape": [2, 1],
+      "weight": [256, 256],
+      "bias_shape": [1],
+      "bias": [256]
+    }
+  ],
+  "input_shape": [1, 2],
+  "input": [256, 256],
+  "output_shape": [1, 1],
+  "output": [768]
+}

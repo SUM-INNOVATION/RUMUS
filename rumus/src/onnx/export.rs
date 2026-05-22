@@ -53,6 +53,9 @@ fn dtype_to_onnx(dtype: DType) -> i32 {
         DType::F16 => ONNX_FLOAT16,
         // Q8 tensors are dequantized to F32 for ONNX export.
         DType::Q8 { .. } => ONNX_FLOAT,
+        DType::FixedI16 { .. } => {
+            panic!("ONNX export does not support FixedI16 (CPU-only fixed-point) tensors")
+        }
     }
 }
 

@@ -766,6 +766,9 @@ pub fn preprocess_shader(source: &str, dtype: crate::tensor::DType) -> String {
             format!("alias scalar = f32;\n{}", source)
         }
         crate::tensor::DType::F16 => format!("enable f16;\nalias scalar = f16;\n{}", source),
+        crate::tensor::DType::FixedI16 { .. } => {
+            panic!("FixedI16 is a CPU-only dtype; it has no GPU shader representation")
+        }
     }
 }
 

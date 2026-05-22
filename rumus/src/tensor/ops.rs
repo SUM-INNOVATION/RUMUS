@@ -2207,6 +2207,18 @@ impl Tensor {
             return self.clone();
         }
 
+        // Fixed-point lives in its own integer world — `to_dtype` does not
+        // bridge fixed-point ↔ floating-point.  Reject explicitly before any
+        // GPU setup runs, so the failure is clear regardless of build features.
+        if self.dtype().is_fixed_point() || target.is_fixed_point() {
+            panic!(
+                "to_dtype: cannot cast between fixed-point and floating-point dtypes \
+                 ({:?} -> {:?}); use Tensor::from_i16_fixed for the fixed-point path",
+                self.dtype(),
+                target,
+            );
+        }
+
         #[allow(unused_variables)]
         let numel = self.numel();
         #[allow(unused_variables)]

@@ -4,6 +4,7 @@ pub mod backend;
 pub mod data;
 #[cfg(feature = "gpu")]
 pub mod ext;
+pub mod fixed;
 pub mod nn;
 #[cfg(feature = "jit")]
 pub mod jit;

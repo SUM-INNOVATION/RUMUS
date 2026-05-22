@@ -38,6 +38,7 @@ impl FusionKey {
                 DType::F32 => 0,
                 DType::F16 => 1,
                 DType::Q8 { .. } => panic!("Q8 tensors cannot be JIT-fused"),
+                DType::FixedI16 { .. } => panic!("FixedI16 tensors cannot be JIT-fused"),
             },
             num_inputs: block.num_inputs,
             num_outputs: block.num_outputs,

@@ -143,6 +143,9 @@ pub fn custom_forward(op: &dyn CustomOp, inputs: &[&Tensor]) -> Tensor {
             DType::F32 => 0,
             DType::F16 => 1,
             DType::Q8 { .. } => panic!("custom_forward: Q8 inputs not supported"),
+            DType::FixedI16 { .. } => {
+                panic!("custom_forward: FixedI16 inputs not supported (CPU-only fixed-point)")
+            }
         },
         num_inputs: op.num_inputs(),
     };

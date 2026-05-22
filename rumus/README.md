@@ -6,7 +6,7 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 
 | Module | Description |
 |--------|-------------|
-| `tensor` | `StorageHandle` (CPU `Vec` or GPU `wgpu::Buffer` via `parking_lot::RwLock<StorageData>`), `Layout`, `AutogradState`, `DType` (`F32`/`F16`/`Q8`), `device_index` for multi-GPU, `Deferred` variant for JIT, N-dimensional broadcasting, `to_dtype()` cast, `to_device()`, `quantize()`/`dequantize()`, `flash_attention()`, `slice_range()`, `cat()`, and all tensor operations |
+| `tensor` | `StorageHandle` (CPU `Vec<f32>` / `Vec<i16>` or GPU `wgpu::Buffer` via `parking_lot::RwLock<StorageData>`), `Layout`, `AutogradState`, `DType` (`F32`/`F16`/`Q8`/`FixedI16 { scale_log2 }`), `from_i16_fixed()` / `fixed_i16_data()` constructors and accessors, `device_index` for multi-GPU, `Deferred` variant for JIT, N-dimensional broadcasting, `to_dtype()` cast, `to_device()`, `quantize()`/`dequantize()`, `flash_attention()`, `slice_range()`, `cat()`, and all tensor operations |
 | `autograd` | Thread-local `Tape`, `GradientStore` (with `merge_from`), Kahn's algorithm backward engine, `backward()` + `backward_with_grad()` (injected gradient seed), `install_tape()` (per-micro-batch isolation), `no_grad()` RAII guard, `VersionSnapshot` with `Weak` references, 31 concrete `BackwardOp` variants (incl. `Cast` + `Custom`) |
 | `backend` | `Backend` trait (CPU) + feature-gated `gpu` module: `GpuContext` singleton (`Arc<Device>` + `Arc<Queue>`, `supports_f16`), `BufferPool`, `PipelineCache` (35+ F32 pipelines + 30 F16 + cast + Q8 + FlashAttention pipelines), `CustomOpCache`, WGSL metaprogramming via `alias scalar` |
 | `nn` | `Parameter`, `Module` trait, `#[derive(Module)]`, `Linear`, `Conv2d`, `ConvTranspose2d`, `MaxPool2d`, `AdaptiveAvgPool2d`, `Flatten`, `Dropout`, `BatchNorm2d`, `LayerNorm`, `Embedding`, `MultiheadAttention`, `TransformerBlock`, activations, losses, safetensors IO. Multi-GPU: `DataParallel`, `AllReduceSync`, `FSDP` with `FsdpSync` barrier |
@@ -17,6 +17,7 @@ Core crate for the **RUMUS** native-Rust deep learning framework.
 | `nn::parallel` | (feature-gated) `DataParallel<M>` (scatter-forward-gather via `std::thread::scope`) + `AllReduceSync` (4-phase WebGPU gradient averaging) |
 | `nn::fsdp` | (feature-gated) `FSDP` — Fully Sharded Data Parallelism: 1/N params per rank, All-Gather forward, `FsdpSync` barrier Reduce-Scatter backward |
 | `ext` | (feature-gated: `gpu`) `CustomOp` + `CustomBackward` plugin API, `CustomOpCache` for dynamic WGSL compilation, `custom_forward()` dispatcher |
+| `fixed` | Deterministic CPU-only `i16` fixed-point inference path for zero-knowledge proof fixtures. `FixedLinear` (widened `i64` MAC, integer bias promotion, round-half-away-from-zero requantization, saturating `i16` cast), integer `relu`, `requantize` helper, `FixedRounding` / `FixedOverflow` semantics, and canonical dependency-free `FixedFixture` JSON export with byte-stable bytes. No `f32` on the path; no GPU |
 | `train` | `Trainer<O: Optimizer>` — closure-based `train_step()` orchestrator |
 
 ## Features

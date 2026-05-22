@@ -42,6 +42,9 @@ fn dtype_to_tag(dtype: DType) -> u32 {
         DType::F32 => DTYPE_TAG_F32,
         DType::F16 => DTYPE_TAG_F16,
         DType::Q8 { .. } => panic!("Q8 tensors cannot be written to .rrec files; dequantize first"),
+        DType::FixedI16 { .. } => {
+            panic!("FixedI16 tensors cannot be written to .rrec files")
+        }
     }
 }
 
@@ -185,6 +188,7 @@ impl RecordWriter {
                 }
             }
             DType::Q8 { .. } => unreachable!("Q8 blocked above"),
+            DType::FixedI16 { .. } => unreachable!("FixedI16 blocked above"),
         };
         written += data_byte_size as u64;
 

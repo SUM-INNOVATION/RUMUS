@@ -65,6 +65,16 @@ pub enum DType {
     /// has a 4-byte header (f16 scale in lower 16 bits, 2 bytes padding)
     /// followed by `block_size` i8 values.
     Q8 { block_size: usize },
+    /// Deterministic signed 16-bit fixed-point.
+    ///
+    /// Each element is a raw `i16` whose real value is `raw / 2^scale_log2`.
+    /// A single **global** `scale_log2` applies to every element of the
+    /// tensor — there are no per-block or per-channel scales (unlike `Q8`).
+    ///
+    /// This is a **CPU-only, inference-only** type used by the integer
+    /// inference path in [`crate::fixed`].  It never participates in
+    /// autograd, GPU compute, ONNX export, or `.rrec` serialization.
+    FixedI16 { scale_log2: u8 },
 }
 
 impl DType {
@@ -75,6 +85,7 @@ impl DType {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::Q8 { .. } => 1, // logical element is i8, but use gpu_buf_size for real sizing
+            DType::FixedI16 { .. } => 2,
         }
     }
 
@@ -93,6 +104,9 @@ impl DType {
                 // 4-byte header (f16 scale + 2B pad) + block_size i8 values per block
                 num_blocks * (4 + block_size)
             }
+            DType::FixedI16 { .. } => {
+                panic!("FixedI16 is a CPU-only dtype; gpu_buf_size is not applicable")
+            }
         };
         ((raw + 3) & !3) as u64
     }
@@ -110,6 +124,11 @@ impl DType {
     pub fn is_quantized(self) -> bool {
         matches!(self, DType::Q8 { .. })
     }
+
+    /// Returns true if this is a fixed-point integer type.
+    pub fn is_fixed_point(self) -> bool {
+        matches!(self, DType::FixedI16 { .. })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +145,9 @@ pub type DataReadGuard<'a> = parking_lot::MappedRwLockReadGuard<'a, [f32]>;
 
 /// Write guard for tensor data.  Derefs to `&mut [f32]`.
 pub type DataWriteGuard<'a> = parking_lot::MappedRwLockWriteGuard<'a, [f32]>;
+
+/// Read guard for fixed-point i16 tensor data.  Derefs to `&[i16]`.
+pub type FixedDataReadGuard<'a> = parking_lot::MappedRwLockReadGuard<'a, [i16]>;
 
 // --- StorageData enum -------------------------------------------------------
 
@@ -148,8 +170,14 @@ pub(crate) enum DirtySide {
 /// and the compiler optimises away all match overhead.
 #[allow(dead_code)] // Gpu/Both/Transferring variants prepared for Chunk 2
 pub(crate) enum StorageData {
-    /// CPU-resident data.
+    /// CPU-resident f32 data.
     Cpu(Vec<f32>),
+
+    /// CPU-resident raw `i16` fixed-point data ([`DType::FixedI16`]).
+    ///
+    /// Never transferred to the GPU; the fixed-point inference path is
+    /// entirely CPU-side and integer-only.
+    CpuI16(Vec<i16>),
 
     /// GPU-resident data.
     #[cfg(feature = "gpu")]
@@ -187,6 +215,7 @@ impl fmt::Debug for StorageData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StorageData::Cpu(v) => f.debug_tuple("Cpu").field(&v.len()).finish(),
+            StorageData::CpuI16(v) => f.debug_tuple("CpuI16").field(&v.len()).finish(),
             #[cfg(feature = "gpu")]
             StorageData::Gpu { len, .. } => {
                 f.debug_struct("Gpu").field("len", len).finish()
@@ -293,6 +322,24 @@ impl StorageHandle {
                 data: RwLock::new(StorageData::Cpu(data)),
                 len,
                 dtype: DType::F32,
+                device_index: 0,
+                version: AtomicUsize::new(0),
+                fence: AtomicUsize::new(NO_FENCE),
+            }),
+        }
+    }
+
+    /// Allocate new CPU storage owning raw `i16` fixed-point `data`.
+    ///
+    /// The resulting storage has dtype [`DType::FixedI16`] with the given
+    /// global `scale_log2`.  CPU-only — never uploaded to the GPU.
+    pub fn new_cpu_i16(data: Vec<i16>, scale_log2: u8) -> Self {
+        let len = data.len();
+        Self {
+            inner: Arc::new(StorageInner {
+                data: RwLock::new(StorageData::CpuI16(data)),
+                len,
+                dtype: DType::FixedI16 { scale_log2 },
                 device_index: 0,
                 version: AtomicUsize::new(0),
                 fence: AtomicUsize::new(NO_FENCE),
@@ -502,6 +549,13 @@ impl StorageHandle {
     /// cast to F32 on the GPU, downloaded, and the CPU mirror replaced.
     /// This enables inspection/printing of F16 tensors without panicking.
     pub fn data(&self) -> DataReadGuard<'_> {
+        if let DType::FixedI16 { .. } = self.inner.dtype {
+            panic!(
+                "Tensor::data() is the f32 accessor; this is a fixed-point \
+                 (FixedI16) tensor — call fixed_i16_data() instead"
+            );
+        }
+
         #[cfg(feature = "gpu")]
         match self.inner.dtype {
             DType::F16 => self.ensure_cpu_f16_as_f32(),
@@ -514,6 +568,9 @@ impl StorageHandle {
 
         parking_lot::RwLockReadGuard::map(self.inner.data.read(), |sd| match sd {
             StorageData::Cpu(v) => v.as_slice(),
+            StorageData::CpuI16(_) => {
+                unreachable!("FixedI16 dtype rejected above")
+            }
             #[cfg(feature = "gpu")]
             StorageData::Both { cpu, .. } => cpu.as_slice(),
             #[cfg(feature = "gpu")]
@@ -526,6 +583,28 @@ impl StorageHandle {
             StorageData::Deferred { .. } => {
                 panic!("cannot read JIT-deferred tensor — flush the JIT block first")
             }
+        })
+    }
+
+    /// Acquire a **read** lock on raw fixed-point `i16` data.
+    ///
+    /// Returns a [`FixedDataReadGuard`] that derefs to `&[i16]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless this storage's dtype is [`DType::FixedI16`].  This is
+    /// deliberate — there is no implicit conversion between the fixed-point
+    /// and floating-point representations.
+    pub fn fixed_i16_data(&self) -> FixedDataReadGuard<'_> {
+        if !self.inner.dtype.is_fixed_point() {
+            panic!(
+                "fixed_i16_data() requires a FixedI16 tensor, but dtype is {:?}",
+                self.inner.dtype
+            );
+        }
+        parking_lot::RwLockReadGuard::map(self.inner.data.read(), |sd| match sd {
+            StorageData::CpuI16(v) => v.as_slice(),
+            _ => unreachable!("FixedI16 dtype is always backed by StorageData::CpuI16"),
         })
     }
 
@@ -702,6 +781,9 @@ impl StorageHandle {
 
         parking_lot::RwLockWriteGuard::map(self.inner.data.write(), |sd| match sd {
             StorageData::Cpu(v) => v.as_mut_slice(),
+            StorageData::CpuI16(_) => {
+                panic!("data_write(): fixed-point (FixedI16) tensors are immutable")
+            }
             #[cfg(feature = "gpu")]
             StorageData::Both { cpu, dirty, .. } => {
                 *dirty = DirtySide::Cpu;
@@ -741,6 +823,9 @@ impl StorageHandle {
             StorageData::Gpu { buffer, .. } => buffer,
             StorageData::Both { gpu, .. } => gpu,
             StorageData::Cpu(_) => unreachable!("ensure_gpu guarantees GPU data"),
+            StorageData::CpuI16(_) => {
+                panic!("fixed-point (FixedI16) tensors have no GPU buffer")
+            }
             StorageData::Transferring => {
                 panic!("cannot access GPU buffer while a device transfer is in progress")
             }
@@ -1100,6 +1185,39 @@ impl Tensor {
         }
     }
 
+    /// Create a new contiguous, inference-only **fixed-point** tensor from
+    /// raw `i16` data.
+    ///
+    /// Each element `data[i]` represents the real value `data[i] / 2^scale_log2`.
+    /// The dtype is [`DType::FixedI16`] and the tensor never participates in
+    /// autograd.  This is the canonical entry point for the integer inference
+    /// path in [`crate::fixed`].
+    ///
+    /// # Panics
+    ///
+    /// - if `scale_log2 > 15` (the scale would not fit a sane i16 range);
+    /// - if the product of `shape` does not equal `data.len()`.
+    pub fn from_i16_fixed(data: Vec<i16>, shape: Vec<usize>, scale_log2: u8) -> Self {
+        assert!(
+            scale_log2 <= 15,
+            "from_i16_fixed: scale_log2 must be <= 15, got {}",
+            scale_log2,
+        );
+        let numel: usize = shape.iter().product();
+        assert_eq!(
+            numel,
+            data.len(),
+            "shape {:?} expects {} elements but got {}",
+            shape, numel, data.len(),
+        );
+        let layout = Layout::contiguous(shape);
+        Self {
+            storage: StorageHandle::new_cpu_i16(data, scale_log2),
+            layout,
+            state: AutogradState::None,
+        }
+    }
+
     pub fn shape(&self) -> &[usize] { self.layout.shape() }
     pub fn strides(&self) -> &[usize] { self.layout.strides() }
     pub fn ndim(&self) -> usize { self.layout.ndim() }
@@ -1119,11 +1237,49 @@ impl Tensor {
     /// Acquire a read lock on the underlying data.
     ///
     /// Returns a [`DataReadGuard`] that derefs to `&[f32]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is a fixed-point ([`DType::FixedI16`]) tensor — use
+    /// [`fixed_i16_data`](Self::fixed_i16_data) instead.  There is no
+    /// implicit fixed-point → float conversion.
     pub fn data(&self) -> DataReadGuard<'_> {
         self.storage.data()
     }
 
+    /// Acquire a read lock on the raw `i16` fixed-point data.
+    ///
+    /// Returns a [`FixedDataReadGuard`] that derefs to `&[i16]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless this is a [`DType::FixedI16`] tensor.
+    pub fn fixed_i16_data(&self) -> FixedDataReadGuard<'_> {
+        self.storage.fixed_i16_data()
+    }
+
+    /// Returns `true` if this tensor uses a fixed-point dtype.
+    pub fn is_fixed_point(&self) -> bool {
+        self.dtype().is_fixed_point()
+    }
+
+    /// Returns the global `scale_log2` of a fixed-point tensor, or `None`
+    /// for any other dtype.
+    pub fn fixed_scale_log2(&self) -> Option<u8> {
+        match self.dtype() {
+            DType::FixedI16 { scale_log2 } => Some(scale_log2),
+            _ => None,
+        }
+    }
+
     pub fn set_requires_grad(&mut self, requires_grad: bool) {
+        if requires_grad && self.is_fixed_point() {
+            panic!(
+                "set_requires_grad(true) is invalid for a fixed-point ({:?}) tensor: \
+                 the fixed-point inference path never participates in autograd",
+                self.dtype(),
+            );
+        }
         match &self.state {
             AutogradState::None if requires_grad => {
                 let grad_id = crate::autograd::context::next_grad_id();
